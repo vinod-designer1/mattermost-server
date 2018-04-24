@@ -4,12 +4,12 @@
 package sqlstore
 
 import (
-	"encoding/json"
 	"os"
 	"strings"
 	"time"
 
 	l4g "github.com/alecthomas/log4go"
+	jsoniter "github.com/json-iterator/go"
 
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/utils"
@@ -401,7 +401,7 @@ func UpgradeDatabaseToVersion49(sqlStore SqlStore) {
 	if shouldPerformUpgrade(sqlStore, VERSION_4_8_1, VERSION_4_9_0) {
 		sqlStore.CreateColumnIfNotExists("Teams", "LastTeamIconUpdate", "bigint", "bigint", "0")
 		defaultTimezone := model.DefaultUserTimezone()
-		defaultTimezoneValue, err := json.Marshal(defaultTimezone)
+		defaultTimezoneValue, err := jsoniter.Marshal(defaultTimezone)
 		if err != nil {
 			l4g.Critical(err)
 		}

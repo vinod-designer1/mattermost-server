@@ -4,12 +4,12 @@
 package commands
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 
 	l4g "github.com/alecthomas/log4go"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/mattermost/mattermost-server/app"
 	"github.com/mattermost/mattermost-server/cmd"
 	"github.com/mattermost/mattermost-server/model"
@@ -614,7 +614,7 @@ func migrateAuthToSamlCmdF(command *cobra.Command, args []string) error {
 		if e != nil {
 			return errors.New("Invalid users file.")
 		}
-		if json.Unmarshal(file, &matches) != nil {
+		if jsoniter.Unmarshal(file, &matches) != nil {
 			return errors.New("Invalid users file.")
 		}
 	}

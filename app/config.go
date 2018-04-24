@@ -10,7 +10,6 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"runtime/debug"
@@ -18,6 +17,7 @@ import (
 	"strings"
 
 	l4g "github.com/alecthomas/log4go"
+	jsoniter "github.com/json-iterator/go"
 
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/utils"
@@ -145,7 +145,7 @@ func (a *App) ensureAsymmetricSigningKey() error {
 
 	result := <-a.Srv.Store.System().GetByName(model.SYSTEM_ASYMMETRIC_SIGNING_KEY)
 	if result.Err == nil {
-		if err := json.Unmarshal([]byte(result.Data.(*model.System).Value), &key); err != nil {
+		if err := jsoniter.Unmarshal([]byte(result.Data.(*model.System).Value), &key); err != nil {
 			return err
 		}
 	}
@@ -167,7 +167,7 @@ func (a *App) ensureAsymmetricSigningKey() error {
 		system := &model.System{
 			Name: model.SYSTEM_ASYMMETRIC_SIGNING_KEY,
 		}
-		v, err := json.Marshal(newKey)
+		v, err := jsoniter.Marshal(newKey)
 		if err != nil {
 			return err
 		}
@@ -184,7 +184,7 @@ func (a *App) ensureAsymmetricSigningKey() error {
 		result := <-a.Srv.Store.System().GetByName(model.SYSTEM_ASYMMETRIC_SIGNING_KEY)
 		if result.Err != nil {
 			return result.Err
-		} else if err := json.Unmarshal([]byte(result.Data.(*model.System).Value), &key); err != nil {
+		} else if err := jsoniter.Unmarshal([]byte(result.Data.(*model.System).Value), &key); err != nil {
 			return err
 		}
 	}
@@ -219,7 +219,7 @@ func (a *App) regenerateClientConfig() {
 		der, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
 		a.clientConfig["AsymmetricSigningPublicKey"] = base64.StdEncoding.EncodeToString(der)
 	}
-	clientConfigJSON, _ := json.Marshal(a.clientConfig)
+	clientConfigJSON, _ := jsoniter.Marshal(a.clientConfig)
 	a.clientConfigHash = fmt.Sprintf("%x", md5.Sum(clientConfigJSON))
 }
 
