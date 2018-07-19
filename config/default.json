@@ -1,6 +1,6 @@
 {
     "ServiceSettings": {
-        "SiteURL": "http://localhost:8065",
+        "SiteURL": "",
         "WebsocketURL": "",
         "LicenseFileLocation": "",
         "ListenAddress": ":8065",
@@ -44,6 +44,9 @@
         "WebserverMode": "gzip",
         "EnableCustomEmoji": false,
         "EnableEmojiPicker": true,
+        "EnableGifPicker": false,
+        "GfycatApiKey": "2_KtH_W5",
+        "GfycatApiSecret": "3wLVZPiswc3DnaiaFoLkDvB4X0IV6CpMkj4tf2inJRsBY6-FnkT08zGmppWFgeof",
         "RestrictCustomEmojiCreation": "all",
         "RestrictPostDelete": "all",
         "AllowEditPost": "always",
@@ -62,7 +65,11 @@
         "ExperimentalGroupUnreadChannels": "disabled",
         "ImageProxyType": "",
         "ImageProxyOptions": "",
-        "ImageProxyURL": ""
+        "ImageProxyURL": "",
+        "EnableAPITeamDeletion": false,
+        "ExperimentalEnableHardenedMode": false,
+        "ExperimentalLimitClientConfig": false,
+        "EnableEmailInvitations": false
     },
     "TeamSettings": {
         "SiteName": "Mattermost",
@@ -70,6 +77,7 @@
         "EnableTeamCreation": true,
         "EnableUserCreation": true,
         "EnableOpenServer": false,
+        "EnableUserDeactivation": false,
         "RestrictCreationToDomains": "",
         "EnableCustomBrand": false,
         "CustomBrandText": "",
@@ -90,10 +98,12 @@
         "EnableConfirmNotificationsToChannel": true,
         "TeammateNameDisplay": "username",
         "ExperimentalEnableAutomaticReplies": false,
+        "ExperimentalHideTownSquareinLHS": false,
         "ExperimentalTownSquareIsReadOnly": false,
         "ExperimentalPrimaryTeam": ""
     },
     "DisplaySettings": {
+        "CustomUrlSchemes": [],
         "ExperimentalTimezone": false
     },
     "ClientRequirements": {
@@ -110,6 +120,7 @@
         "DataSourceReplicas": [],
         "DataSourceSearchReplicas": [],
         "MaxIdleConns": 20,
+        "ConnMaxLifetimeMilliseconds": 3600000,
         "MaxOpenConns": 300,
         "Trace": false,
         "AtRestEncryptKey": "",
@@ -142,7 +153,7 @@
         "Directory": "./data/",
         "EnablePublicLink": false,
         "PublicLinkSalt": "",
-        "InitialFont": "luximbi.ttf",
+        "InitialFont": "nunito-bold.ttf",
         "AmazonS3AccessKeyId": "",
         "AmazonS3SecretAccessKey": "",
         "AmazonS3Bucket": "",
@@ -176,11 +187,16 @@
         "EnableEmailBatching": false,
         "EmailBatchingBufferSize": 256,
         "EmailBatchingInterval": 30,
+        "EnablePreviewModeBanner": true,
         "SkipServerCertificateVerification": false,
         "EmailNotificationContentsType": "full",
         "LoginButtonColor": "",
         "LoginButtonBorderColor": "",
         "LoginButtonTextColor": ""
+    },
+    "ExtensionSettings": {
+        "EnableExperimentalExtensions": false,
+        "AllowedExtensionsIDs": []
     },
     "RateLimitSettings": {
         "Enable": false,
@@ -263,6 +279,7 @@
         "NicknameAttribute": "",
         "IdAttribute": "",
         "PositionAttribute": "",
+        "LoginIdAttribute": "",
         "SyncIntervalMinutes": 60,
         "SkipCertificateVerification": false,
         "QueryTimeout": 60,
@@ -320,12 +337,19 @@
         "UseExperimentalGossip": false,
         "ReadOnlyConfig": true,
         "GossipPort": 8074,
-        "StreamingPort": 8075
+        "StreamingPort": 8075,
+        "MaxIdleConns": 100,
+        "MaxIdleConnsPerHost": 128,
+        "IdleConnTimeoutMilliseconds": 90000
     },
     "MetricsSettings": {
         "Enable": false,
         "BlockProfileRate": 0,
         "ListenAddress": ":8067"
+    },
+    "ExperimentalSettings": {
+        "ClientSideCertEnable": false,
+        "ClientSideCertCheck": "secondary"
     },
     "AnalyticsSettings": {
         "MaxUsersForStatistics": 2500

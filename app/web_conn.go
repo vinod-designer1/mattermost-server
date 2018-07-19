@@ -33,6 +33,7 @@ type WebConn struct {
 	Send                      chan model.WebSocketMessage
 	sessionToken              atomic.Value
 	session                   atomic.Value
+	LastUserActivityAt        int64
 	UserId                    string
 	T                         goi18n.TranslateFunc
 	Locale                    string
@@ -46,20 +47,21 @@ type WebConn struct {
 func (a *App) NewWebConn(ws *websocket.Conn, session model.Session, t goi18n.TranslateFunc, locale string) *WebConn {
 	if len(session.UserId) > 0 {
 		a.Go(func() {
-			a.SetStatusOnline(session.UserId, session.Id, false)
+			a.SetStatusOnline(session.UserId, false)
 			a.UpdateLastActivityAtIfNeeded(session)
 		})
 	}
 
 	wc := &WebConn{
-		App:          a,
-		Send:         make(chan model.WebSocketMessage, SEND_QUEUE_SIZE),
-		WebSocket:    ws,
-		UserId:       session.UserId,
-		T:            t,
-		Locale:       locale,
-		endWritePump: make(chan struct{}, 2),
-		pumpFinished: make(chan struct{}, 1),
+		App:                a,
+		Send:               make(chan model.WebSocketMessage, SEND_QUEUE_SIZE),
+		WebSocket:          ws,
+		LastUserActivityAt: model.GetMillis(),
+		UserId:             session.UserId,
+		T:                  t,
+		Locale:             locale,
+		endWritePump:       make(chan struct{}, 2),
+		pumpFinished:       make(chan struct{}, 1),
 	}
 
 	wc.SetSession(&session)

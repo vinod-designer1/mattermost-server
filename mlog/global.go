@@ -11,7 +11,9 @@ import (
 var globalLogger *Logger
 
 func InitGlobalLogger(logger *Logger) {
-	globalLogger = logger
+	glob := *logger
+	glob.zap = glob.zap.WithOptions(zap.AddCallerSkip(1))
+	globalLogger = &glob
 	Debug = globalLogger.Debug
 	Info = globalLogger.Info
 	Warn = globalLogger.Warn
@@ -20,7 +22,7 @@ func InitGlobalLogger(logger *Logger) {
 }
 
 func RedirectStdLog(logger *Logger) {
-	zap.RedirectStdLogAt(logger.zap.With(zap.String("source", "stdlog")), zapcore.ErrorLevel)
+	zap.RedirectStdLogAt(logger.zap.With(zap.String("source", "stdlog")).WithOptions(zap.AddCallerSkip(-2)), zapcore.ErrorLevel)
 }
 
 type LogFunc func(string, ...Field)
@@ -35,8 +37,8 @@ func GloballyEnableDebugLogForTest() {
 	globalLogger.consoleLevel.SetLevel(zapcore.DebugLevel)
 }
 
-var Debug LogFunc
-var Info LogFunc
-var Warn LogFunc
-var Error LogFunc
-var Critical LogFunc
+var Debug LogFunc = defaultDebugLog
+var Info LogFunc = defaultInfoLog
+var Warn LogFunc = defaultWarnLog
+var Error LogFunc = defaultErrorLog
+var Critical LogFunc = defaultCriticalLog

@@ -15,6 +15,7 @@ func (api *API) InitChannel() {
 	api.BaseRoutes.Channels.Handle("/direct", api.ApiSessionRequired(createDirectChannel)).Methods("POST")
 	api.BaseRoutes.Channels.Handle("/group", api.ApiSessionRequired(createGroupChannel)).Methods("POST")
 	api.BaseRoutes.Channels.Handle("/members/{user_id:[A-Za-z0-9]+}/view", api.ApiSessionRequired(viewChannel)).Methods("POST")
+	api.BaseRoutes.Channels.Handle("/{channel_id:[A-Za-z0-9]+}/scheme", api.ApiSessionRequired(updateChannelScheme)).Methods("PUT")
 
 	api.BaseRoutes.ChannelsForTeam.Handle("", api.ApiSessionRequired(getPublicChannelsForTeam)).Methods("GET")
 	api.BaseRoutes.ChannelsForTeam.Handle("/deleted", api.ApiSessionRequired(getDeletedChannelsForTeam)).Methods("GET")
@@ -44,6 +45,7 @@ func (api *API) InitChannel() {
 	api.BaseRoutes.ChannelMember.Handle("", api.ApiSessionRequired(getChannelMember)).Methods("GET")
 	api.BaseRoutes.ChannelMember.Handle("", api.ApiSessionRequired(removeChannelMember)).Methods("DELETE")
 	api.BaseRoutes.ChannelMember.Handle("/roles", api.ApiSessionRequired(updateChannelMemberRoles)).Methods("PUT")
+	api.BaseRoutes.ChannelMember.Handle("/schemeRoles", api.ApiSessionRequired(updateChannelMemberSchemeRoles)).Methods("PUT")
 	api.BaseRoutes.ChannelMember.Handle("/notify_props", api.ApiSessionRequired(updateChannelMemberNotifyProps)).Methods("PUT")
 }
 
@@ -94,12 +96,28 @@ func updateChannel(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err = c.App.GetChannelMember(channel.Id, c.Session.UserId); err != nil {
-		c.Err = err
-		return
-	}
+	switch oldChannel.Type {
+	case model.CHANNEL_OPEN:
+		if !c.App.SessionHasPermissionToChannel(c.Session, c.Params.ChannelId, model.PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES)
+			return
+		}
 
-	if !CanManageChannel(c, channel) {
+	case model.CHANNEL_PRIVATE:
+		if !c.App.SessionHasPermissionToChannel(c.Session, c.Params.ChannelId, model.PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES)
+			return
+		}
+
+	case model.CHANNEL_GROUP, model.CHANNEL_DIRECT:
+		// Modifying the header is not linked to any specific permission for group/dm channels, so just check for membership.
+		if _, err := c.App.GetChannelMember(channel.Id, c.Session.UserId); err != nil {
+			c.Err = model.NewAppError("updateChannel", "api.channel.patch_update_channel.forbidden.app_error", nil, "", http.StatusForbidden)
+			return
+		}
+
+	default:
+		c.Err = model.NewAppError("updateChannel", "api.channel.patch_update_channel.forbidden.app_error", nil, "", http.StatusForbidden)
 		return
 	}
 
@@ -153,14 +171,12 @@ func convertChannelToPrivate(c *Context, w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if !c.App.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_SYSTEM) {
-		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
-		return
-	}
-
 	oldPublicChannel, err := c.App.GetChannel(c.Params.ChannelId)
 	if err != nil {
 		c.Err = err
+		return
+	} else if !c.App.SessionHasPermissionToTeam(c.Session, oldPublicChannel.TeamId, model.PERMISSION_MANAGE_TEAM) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_TEAM)
 		return
 	} else if oldPublicChannel.Type == model.CHANNEL_PRIVATE {
 		c.Err = model.NewAppError("convertChannelToPrivate", "api.channel.convert_channel_to_private.private_channel_error", nil, "", http.StatusBadRequest)
@@ -205,17 +221,45 @@ func patchChannel(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !CanManageChannel(c, oldChannel) {
+	switch oldChannel.Type {
+	case model.CHANNEL_OPEN:
+		if !c.App.SessionHasPermissionToChannel(c.Session, c.Params.ChannelId, model.PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES)
+			return
+		}
+
+	case model.CHANNEL_PRIVATE:
+		if !c.App.SessionHasPermissionToChannel(c.Session, c.Params.ChannelId, model.PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES)
+			return
+		}
+
+	case model.CHANNEL_GROUP, model.CHANNEL_DIRECT:
+		// Modifying the header is not linked to any specific permission for group/dm channels, so just check for membership.
+		if _, err := c.App.GetChannelMember(c.Params.ChannelId, c.Session.UserId); err != nil {
+			c.Err = model.NewAppError("patchChannel", "api.channel.patch_update_channel.forbidden.app_error", nil, "", http.StatusForbidden)
+			return
+		}
+
+	default:
+		c.Err = model.NewAppError("patchChannel", "api.channel.patch_update_channel.forbidden.app_error", nil, "", http.StatusForbidden)
 		return
 	}
 
-	if rchannel, err := c.App.PatchChannel(oldChannel, patch, c.Session.UserId); err != nil {
+	rchannel, err := c.App.PatchChannel(oldChannel, patch, c.Session.UserId)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		c.LogAudit("")
-		w.Write([]byte(rchannel.ToJson()))
 	}
+
+	err = c.App.FillInChannelProps(rchannel)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	c.LogAudit("")
+	w.Write([]byte(rchannel.ToJson()))
 }
 
 func restoreChannel(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -246,20 +290,6 @@ func restoreChannel(c *Context, w http.ResponseWriter, r *http.Request) {
 	c.LogAudit("name=" + channel.Name)
 	w.Write([]byte(channel.ToJson()))
 
-}
-
-func CanManageChannel(c *Context, channel *model.Channel) bool {
-	if channel.Type == model.CHANNEL_OPEN && !c.App.SessionHasPermissionToChannel(c.Session, channel.Id, model.PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES) {
-		c.SetPermissionError(model.PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES)
-		return false
-	}
-
-	if channel.Type == model.CHANNEL_PRIVATE && !c.App.SessionHasPermissionToChannel(c.Session, channel.Id, model.PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES) {
-		c.SetPermissionError(model.PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES)
-		return false
-	}
-
-	return true
 }
 
 func createDirectChannel(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -361,6 +391,12 @@ func getChannel(c *Context, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	err = c.App.FillInChannelProps(channel)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
 	w.Write([]byte(channel.ToJson()))
 }
 
@@ -444,13 +480,19 @@ func getPublicChannelsForTeam(c *Context, w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if channels, err := c.App.GetPublicChannelsForTeam(c.Params.TeamId, c.Params.Page*c.Params.PerPage, c.Params.PerPage); err != nil {
+	channels, err := c.App.GetPublicChannelsForTeam(c.Params.TeamId, c.Params.Page*c.Params.PerPage, c.Params.PerPage)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(channels.ToJson()))
+	}
+
+	err = c.App.FillInChannelsProps(channels)
+	if err != nil {
+		c.Err = err
 		return
 	}
+
+	w.Write([]byte(channels.ToJson()))
 }
 
 func getDeletedChannelsForTeam(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -464,13 +506,19 @@ func getDeletedChannelsForTeam(c *Context, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if channels, err := c.App.GetDeletedChannels(c.Params.TeamId, c.Params.Page*c.Params.PerPage, c.Params.PerPage); err != nil {
+	channels, err := c.App.GetDeletedChannels(c.Params.TeamId, c.Params.Page*c.Params.PerPage, c.Params.PerPage)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(channels.ToJson()))
+	}
+
+	err = c.App.FillInChannelsProps(channels)
+	if err != nil {
+		c.Err = err
 		return
 	}
+
+	w.Write([]byte(channels.ToJson()))
 }
 
 func getPublicChannelsByIdsForTeam(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -497,12 +545,19 @@ func getPublicChannelsByIdsForTeam(c *Context, w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if channels, err := c.App.GetPublicChannelsByIdsForTeam(c.Params.TeamId, channelIds); err != nil {
+	channels, err := c.App.GetPublicChannelsByIdsForTeam(c.Params.TeamId, channelIds)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(channels.ToJson()))
 	}
+
+	err = c.App.FillInChannelsProps(channels)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(channels.ToJson()))
 }
 
 func getChannelsForTeamForUser(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -521,15 +576,24 @@ func getChannelsForTeamForUser(c *Context, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if channels, err := c.App.GetChannelsForUser(c.Params.TeamId, c.Params.UserId); err != nil {
+	channels, err := c.App.GetChannelsForUser(c.Params.TeamId, c.Params.UserId)
+	if err != nil {
 		c.Err = err
 		return
-	} else if c.HandleEtag(channels.Etag(), "Get Channels", w, r) {
-		return
-	} else {
-		w.Header().Set(model.HEADER_ETAG_SERVER, channels.Etag())
-		w.Write([]byte(channels.ToJson()))
 	}
+
+	if c.HandleEtag(channels.Etag(), "Get Channels", w, r) {
+		return
+	}
+
+	err = c.App.FillInChannelsProps(channels)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Header().Set(model.HEADER_ETAG_SERVER, channels.Etag())
+	w.Write([]byte(channels.ToJson()))
 }
 
 func autocompleteChannelsForTeam(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -545,12 +609,15 @@ func autocompleteChannelsForTeam(c *Context, w http.ResponseWriter, r *http.Requ
 
 	name := r.URL.Query().Get("name")
 
-	if channels, err := c.App.AutocompleteChannels(c.Params.TeamId, name); err != nil {
+	channels, err := c.App.AutocompleteChannels(c.Params.TeamId, name)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(channels.ToJson()))
 	}
+
+	// Don't fill in channels props, since unused by client and potentially expensive.
+
+	w.Write([]byte(channels.ToJson()))
 }
 
 func searchChannelsForTeam(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -570,12 +637,15 @@ func searchChannelsForTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if channels, err := c.App.SearchChannels(c.Params.TeamId, props.Term); err != nil {
+	channels, err := c.App.SearchChannels(c.Params.TeamId, props.Term)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(channels.ToJson()))
 	}
+
+	// Don't fill in channels props, since unused by client and potentially expensive.
+
+	w.Write([]byte(channels.ToJson()))
 }
 
 func deleteChannel(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -588,6 +658,11 @@ func deleteChannel(c *Context, w http.ResponseWriter, r *http.Request) {
 	var err *model.AppError
 	if channel, err = c.App.GetChannel(c.Params.ChannelId); err != nil {
 		c.Err = err
+		return
+	}
+
+	if channel.Type == model.CHANNEL_DIRECT || channel.Type == model.CHANNEL_GROUP {
+		c.Err = model.NewAppError("deleteChannel", "api.channel.delete_channel.type.invalid", nil, "", http.StatusBadRequest)
 		return
 	}
 
@@ -638,6 +713,12 @@ func getChannelByName(c *Context, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	err = c.App.FillInChannelProps(channel)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
 	w.Write([]byte(channel.ToJson()))
 }
 
@@ -657,6 +738,12 @@ func getChannelByNameForTeamName(c *Context, w http.ResponseWriter, r *http.Requ
 
 	if !c.App.SessionHasPermissionToChannel(c.Session, channel.Id, model.PERMISSION_READ_CHANNEL) {
 		c.SetPermissionError(model.PERMISSION_READ_CHANNEL)
+		return
+	}
+
+	err = c.App.FillInChannelProps(channel)
+	if err != nil {
+		c.Err = err
 		return
 	}
 
@@ -812,6 +899,31 @@ func updateChannelMemberRoles(c *Context, w http.ResponseWriter, r *http.Request
 	ReturnStatusOK(w)
 }
 
+func updateChannelMemberSchemeRoles(c *Context, w http.ResponseWriter, r *http.Request) {
+	c.RequireChannelId().RequireUserId()
+	if c.Err != nil {
+		return
+	}
+
+	schemeRoles := model.SchemeRolesFromJson(r.Body)
+	if schemeRoles == nil {
+		c.SetInvalidParam("scheme_roles")
+		return
+	}
+
+	if !c.App.SessionHasPermissionToChannel(c.Session, c.Params.ChannelId, model.PERMISSION_MANAGE_CHANNEL_ROLES) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_CHANNEL_ROLES)
+		return
+	}
+
+	if _, err := c.App.UpdateChannelMemberSchemeRoles(c.Params.ChannelId, c.Params.UserId, schemeRoles.SchemeUser, schemeRoles.SchemeAdmin); err != nil {
+		c.Err = err
+		return
+	}
+
+	ReturnStatusOK(w)
+}
+
 func updateChannelMemberNotifyProps(c *Context, w http.ResponseWriter, r *http.Request) {
 	c.RequireChannelId().RequireUserId()
 	if c.Err != nil {
@@ -945,6 +1057,56 @@ func removeChannelMember(c *Context, w http.ResponseWriter, r *http.Request) {
 	}
 
 	c.LogAudit("name=" + channel.Name + " user_id=" + c.Params.UserId)
+
+	ReturnStatusOK(w)
+}
+
+func updateChannelScheme(c *Context, w http.ResponseWriter, r *http.Request) {
+	c.RequireChannelId()
+	if c.Err != nil {
+		return
+	}
+
+	schemeID := model.SchemeIDFromJson(r.Body)
+	if schemeID == nil || len(*schemeID) != 26 {
+		c.SetInvalidParam("scheme_id")
+		return
+	}
+
+	if c.App.License() == nil {
+		c.Err = model.NewAppError("Api4.UpdateChannelScheme", "api.channel.update_channel_scheme.license.error", nil, "", http.StatusNotImplemented)
+		return
+	}
+
+	if !c.App.SessionHasPermissionToChannel(c.Session, c.Params.ChannelId, model.PERMISSION_MANAGE_SYSTEM) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
+		return
+	}
+
+	scheme, err := c.App.GetScheme(*schemeID)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	if scheme.Scope != model.SCHEME_SCOPE_CHANNEL {
+		c.Err = model.NewAppError("Api4.UpdateChannelScheme", "api.channel.update_channel_scheme.scheme_scope.error", nil, "", http.StatusBadRequest)
+		return
+	}
+
+	channel, err := c.App.GetChannel(c.Params.ChannelId)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	channel.SchemeId = &scheme.Id
+
+	_, err = c.App.UpdateChannelScheme(channel)
+	if err != nil {
+		c.Err = err
+		return
+	}
 
 	ReturnStatusOK(w)
 }

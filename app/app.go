@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"path"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,19 +17,22 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
+	"github.com/throttled/throttled"
 
 	"github.com/mattermost/mattermost-server/einterfaces"
 	ejobs "github.com/mattermost/mattermost-server/einterfaces/jobs"
 	"github.com/mattermost/mattermost-server/jobs"
+	tjobs "github.com/mattermost/mattermost-server/jobs/interfaces"
 	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/plugin/pluginenv"
+	"github.com/mattermost/mattermost-server/plugin"
 	"github.com/mattermost/mattermost-server/store"
 	"github.com/mattermost/mattermost-server/store/sqlstore"
 	"github.com/mattermost/mattermost-server/utils"
 )
 
 const ADVANCED_PERMISSIONS_MIGRATION_KEY = "AdvancedPermissionsMigrationComplete"
+const EMOJIS_PERMISSIONS_MIGRATION_KEY = "EmojisPermissionsMigrationComplete"
 
 type App struct {
 	goroutineCount      int32
@@ -38,10 +42,11 @@ type App struct {
 
 	Log *mlog.Logger
 
-	PluginEnv              *pluginenv.Environment
+	Plugins                *plugin.Environment
 	PluginConfigListenerId string
 
-	EmailBatching *EmailBatchingJob
+	EmailBatching    *EmailBatchingJob
+	EmailRateLimiter *throttled.GCRARateLimiter
 
 	Hubs                        []*Hub
 	HubsStopCheckingForDeadlock chan bool
@@ -49,12 +54,10 @@ type App struct {
 	Jobs *jobs.JobServer
 
 	AccountMigration einterfaces.AccountMigrationInterface
-	Brand            einterfaces.BrandInterface
 	Cluster          einterfaces.ClusterInterface
 	Compliance       einterfaces.ComplianceInterface
 	DataRetention    einterfaces.DataRetentionInterface
 	Elasticsearch    einterfaces.ElasticsearchInterface
-	Emoji            einterfaces.EmojiInterface
 	Ldap             einterfaces.LdapInterface
 	MessageExport    einterfaces.MessageExportInterface
 	Metrics          einterfaces.MetricsInterface
@@ -88,9 +91,12 @@ type App struct {
 	pluginCommands     []*PluginCommand
 	pluginCommandsLock sync.RWMutex
 
-	clientConfig     map[string]string
-	clientConfigHash string
-	diagnosticId     string
+	clientConfig        map[string]string
+	clientConfigHash    string
+	limitedClientConfig map[string]string
+	diagnosticId        string
+
+	phase2PermissionsMigrationComplete bool
 }
 
 var appCount = 0
@@ -103,10 +109,12 @@ func New(options ...Option) (outApp *App, outErr error) {
 		panic("Only one App should exist at a time. Did you forget to call Shutdown()?")
 	}
 
+	rootRouter := mux.NewRouter()
+
 	app := &App{
 		goroutineExitSignal: make(chan struct{}, 1),
 		Srv: &Server{
-			Router: mux.NewRouter(),
+			RootRouter: rootRouter,
 		},
 		sessionCache:     utils.NewLru(model.SESSION_CACHE_SIZE),
 		configFile:       "config.json",
@@ -176,7 +184,10 @@ func New(options ...Option) (outApp *App, outErr error) {
 		})
 
 	})
-	app.regenerateClientConfig()
+
+	if err := app.SetupInviteEmailRateLimiting(); err != nil {
+		return nil, err
+	}
 
 	mlog.Info("Server is initializing...")
 
@@ -199,12 +210,29 @@ func New(options ...Option) (outApp *App, outErr error) {
 		return nil, errors.Wrapf(err, "unable to ensure asymmetric signing key")
 	}
 
-	app.initJobs()
+	app.EnsureDiagnosticId()
+	app.regenerateClientConfig()
 
-	app.initBuiltInPlugins()
+	app.initJobs()
+	app.AddLicenseListener(func() {
+		app.initJobs()
+	})
+
+	subpath, err := utils.GetSubpathFromConfig(app.Config())
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse SiteURL subpath")
+	}
+	app.Srv.Router = app.Srv.RootRouter.PathPrefix(subpath).Subrouter()
 	app.Srv.Router.HandleFunc("/plugins/{plugin_id:[A-Za-z0-9\\_\\-\\.]+}", app.ServePluginRequest)
 	app.Srv.Router.HandleFunc("/plugins/{plugin_id:[A-Za-z0-9\\_\\-\\.]+}/{anything:.*}", app.ServePluginRequest)
 
+	// If configured with a subpath, redirect 404s at the root back into the subpath.
+	if subpath != "/" {
+		app.Srv.RootRouter.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Path = path.Join(subpath, r.URL.Path)
+			http.Redirect(w, r, r.URL.String(), http.StatusFound)
+		})
+	}
 	app.Srv.Router.NotFoundHandler = http.HandlerFunc(app.Handle404)
 
 	app.Srv.WebSocketRouter = &WebSocketRouter{
@@ -253,12 +281,6 @@ func RegisterAccountMigrationInterface(f func(*App) einterfaces.AccountMigration
 	accountMigrationInterface = f
 }
 
-var brandInterface func(*App) einterfaces.BrandInterface
-
-func RegisterBrandInterface(f func(*App) einterfaces.BrandInterface) {
-	brandInterface = f
-}
-
 var clusterInterface func(*App) einterfaces.ClusterInterface
 
 func RegisterClusterInterface(f func(*App) einterfaces.ClusterInterface) {
@@ -281,12 +303,6 @@ var elasticsearchInterface func(*App) einterfaces.ElasticsearchInterface
 
 func RegisterElasticsearchInterface(f func(*App) einterfaces.ElasticsearchInterface) {
 	elasticsearchInterface = f
-}
-
-var emojiInterface func(*App) einterfaces.EmojiInterface
-
-func RegisterEmojiInterface(f func(*App) einterfaces.EmojiInterface) {
-	emojiInterface = f
 }
 
 var jobsDataRetentionJobInterface func(*App) ejobs.DataRetentionJobInterface
@@ -317,6 +333,12 @@ var jobsLdapSyncInterface func(*App) ejobs.LdapSyncInterface
 
 func RegisterJobsLdapSyncInterface(f func(*App) ejobs.LdapSyncInterface) {
 	jobsLdapSyncInterface = f
+}
+
+var jobsMigrationsInterface func(*App) tjobs.MigrationsJobInterface
+
+func RegisterJobsMigrationsJobInterface(f func(*App) tjobs.MigrationsJobInterface) {
+	jobsMigrationsInterface = f
 }
 
 var ldapInterface func(*App) einterfaces.LdapInterface
@@ -353,9 +375,6 @@ func (a *App) initEnterprise() {
 	if accountMigrationInterface != nil {
 		a.AccountMigration = accountMigrationInterface(a)
 	}
-	if brandInterface != nil {
-		a.Brand = brandInterface(a)
-	}
 	if clusterInterface != nil {
 		a.Cluster = clusterInterface(a)
 	}
@@ -364,9 +383,6 @@ func (a *App) initEnterprise() {
 	}
 	if elasticsearchInterface != nil {
 		a.Elasticsearch = elasticsearchInterface(a)
-	}
-	if emojiInterface != nil {
-		a.Emoji = emojiInterface(a)
 	}
 	if ldapInterface != nil {
 		a.Ldap = ldapInterface(a)
@@ -412,6 +428,9 @@ func (a *App) initJobs() {
 	}
 	if jobsLdapSyncInterface != nil {
 		a.Jobs.LdapSync = jobsLdapSyncInterface(a)
+	}
+	if jobsMigrationsInterface != nil {
+		a.Jobs.Migrations = jobsMigrationsInterface(a)
 	}
 }
 
@@ -514,7 +533,7 @@ func (a *App) Handle404(w http.ResponseWriter, r *http.Request) {
 
 	mlog.Debug(fmt.Sprintf("%v: code=404 ip=%v", r.URL.Path, utils.GetIpAddress(r)))
 
-	utils.RenderWebAppError(w, r, err, a.AsymmetricSigningKey())
+	utils.RenderWebAppError(a.Config(), w, r, err, a.AsymmetricSigningKey())
 }
 
 // This function migrates the default built in roles from code/config to the database.
@@ -560,6 +579,14 @@ func (a *App) DoAdvancedPermissionsMigration() {
 		return
 	}
 
+	config := a.Config()
+	if *config.ServiceSettings.AllowEditPost == model.ALLOW_EDIT_POST_ALWAYS {
+		*config.ServiceSettings.PostEditTimeLimit = -1
+		if err := a.SaveConfig(config, true); err != nil {
+			mlog.Error("Failed to update config in Advanced Permissions Phase 1 Migration.", mlog.String("error", err.Error()))
+		}
+	}
+
 	system := model.System{
 		Name:  ADVANCED_PERMISSIONS_MIGRATION_KEY,
 		Value: "true",
@@ -567,6 +594,89 @@ func (a *App) DoAdvancedPermissionsMigration() {
 
 	if result := <-a.Srv.Store.System().Save(&system); result.Err != nil {
 		mlog.Critical("Failed to mark advanced permissions migration as completed.")
+		mlog.Critical(fmt.Sprint(result.Err))
+	}
+}
+
+func (a *App) SetPhase2PermissionsMigrationStatus(isComplete bool) error {
+	if !isComplete {
+		res := <-a.Srv.Store.System().PermanentDeleteByName(model.MIGRATION_KEY_ADVANCED_PERMISSIONS_PHASE_2)
+		if res.Err != nil {
+			return res.Err
+		}
+	}
+	a.phase2PermissionsMigrationComplete = isComplete
+	return nil
+}
+
+func (a *App) DoEmojisPermissionsMigration() {
+	// If the migration is already marked as completed, don't do it again.
+	if result := <-a.Srv.Store.System().GetByName(EMOJIS_PERMISSIONS_MIGRATION_KEY); result.Err == nil {
+		return
+	}
+
+	var role *model.Role = nil
+	var systemAdminRole *model.Role = nil
+	var err *model.AppError = nil
+
+	mlog.Info("Migrating emojis config to database.")
+	switch *a.Config().ServiceSettings.RestrictCustomEmojiCreation {
+	case model.RESTRICT_EMOJI_CREATION_ALL:
+		role, err = a.GetRoleByName(model.SYSTEM_USER_ROLE_ID)
+		if err != nil {
+			mlog.Critical("Failed to migrate emojis creation permissions from mattermost config.")
+			mlog.Critical(err.Error())
+			return
+		}
+		break
+	case model.RESTRICT_EMOJI_CREATION_ADMIN:
+		role, err = a.GetRoleByName(model.TEAM_ADMIN_ROLE_ID)
+		if err != nil {
+			mlog.Critical("Failed to migrate emojis creation permissions from mattermost config.")
+			mlog.Critical(err.Error())
+			return
+		}
+		break
+	case model.RESTRICT_EMOJI_CREATION_SYSTEM_ADMIN:
+		role = nil
+		break
+	default:
+		mlog.Critical("Failed to migrate emojis creation permissions from mattermost config.")
+		mlog.Critical("Invalid restrict emoji creation setting")
+		return
+	}
+
+	if role != nil {
+		role.Permissions = append(role.Permissions, model.PERMISSION_MANAGE_EMOJIS.Id)
+		if result := <-a.Srv.Store.Role().Save(role); result.Err != nil {
+			mlog.Critical("Failed to migrate emojis creation permissions from mattermost config.")
+			mlog.Critical(result.Err.Error())
+			return
+		}
+	}
+
+	systemAdminRole, err = a.GetRoleByName(model.SYSTEM_ADMIN_ROLE_ID)
+	if err != nil {
+		mlog.Critical("Failed to migrate emojis creation permissions from mattermost config.")
+		mlog.Critical(err.Error())
+		return
+	}
+
+	systemAdminRole.Permissions = append(systemAdminRole.Permissions, model.PERMISSION_MANAGE_EMOJIS.Id)
+	systemAdminRole.Permissions = append(systemAdminRole.Permissions, model.PERMISSION_MANAGE_OTHERS_EMOJIS.Id)
+	if result := <-a.Srv.Store.Role().Save(systemAdminRole); result.Err != nil {
+		mlog.Critical("Failed to migrate emojis creation permissions from mattermost config.")
+		mlog.Critical(result.Err.Error())
+		return
+	}
+
+	system := model.System{
+		Name:  EMOJIS_PERMISSIONS_MIGRATION_KEY,
+		Value: "true",
+	}
+
+	if result := <-a.Srv.Store.System().Save(&system); result.Err != nil {
+		mlog.Critical("Failed to mark emojis permissions migration as completed.")
 		mlog.Critical(fmt.Sprint(result.Err))
 	}
 }

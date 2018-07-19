@@ -28,7 +28,6 @@ import (
 const (
 	INDEX_TYPE_FULL_TEXT = "full_text"
 	INDEX_TYPE_DEFAULT   = "default"
-	MAX_DB_CONN_LIFETIME = 60
 	DB_PING_ATTEMPTS     = 18
 	DB_PING_TIMEOUT_SECS = 10
 )
@@ -91,6 +90,7 @@ type SqlSupplierOldStores struct {
 	plugin               store.PluginStore
 	channelMemberHistory store.ChannelMemberHistoryStore
 	role                 store.RoleStore
+	scheme               store.SchemeStore
 }
 
 type SqlSupplier struct {
@@ -104,6 +104,7 @@ type SqlSupplier struct {
 	searchReplicas []*gorp.DbMap
 	oldStores      SqlSupplierOldStores
 	settings       *model.SqlSettings
+	lockedToMaster bool
 }
 
 func NewSqlSupplier(settings model.SqlSettings, metrics einterfaces.MetricsInterface) *SqlSupplier {
@@ -141,6 +142,7 @@ func NewSqlSupplier(settings model.SqlSettings, metrics einterfaces.MetricsInter
 
 	initSqlSupplierReactions(supplier)
 	initSqlSupplierRoles(supplier)
+	initSqlSupplierSchemes(supplier)
 
 	err := supplier.GetMaster().CreateTablesIfNotExists()
 	if err != nil {
@@ -215,7 +217,7 @@ func setupConnection(con_type string, dataSource string, settings *model.SqlSett
 
 	db.SetMaxIdleConns(*settings.MaxIdleConns)
 	db.SetMaxOpenConns(*settings.MaxOpenConns)
-	db.SetConnMaxLifetime(time.Duration(MAX_DB_CONN_LIFETIME) * time.Minute)
+	db.SetConnMaxLifetime(time.Duration(*settings.ConnMaxLifetimeMilliseconds) * time.Millisecond)
 
 	var dbmap *gorp.DbMap
 
@@ -281,7 +283,7 @@ func (ss *SqlSupplier) GetSearchReplica() *gorp.DbMap {
 }
 
 func (ss *SqlSupplier) GetReplica() *gorp.DbMap {
-	if len(ss.settings.DataSourceReplicas) == 0 {
+	if len(ss.settings.DataSourceReplicas) == 0 || ss.lockedToMaster {
 		return ss.GetMaster()
 	}
 
@@ -477,6 +479,40 @@ func (ss *SqlSupplier) CreateColumnIfNotExists(tableName string, columnName stri
 
 	} else if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
 		_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " ADD " + columnName + " " + mySqlColType + " DEFAULT '" + defaultValue + "'")
+		if err != nil {
+			mlog.Critical(fmt.Sprintf("Failed to create column %v", err))
+			time.Sleep(time.Second)
+			os.Exit(EXIT_CREATE_COLUMN_MYSQL)
+		}
+
+		return true
+
+	} else {
+		mlog.Critical("Failed to create column because of missing driver")
+		time.Sleep(time.Second)
+		os.Exit(EXIT_CREATE_COLUMN_MISSING)
+		return false
+	}
+}
+
+func (ss *SqlSupplier) CreateColumnIfNotExistsNoDefault(tableName string, columnName string, mySqlColType string, postgresColType string) bool {
+
+	if ss.DoesColumnExist(tableName, columnName) {
+		return false
+	}
+
+	if ss.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+		_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " ADD " + columnName + " " + postgresColType)
+		if err != nil {
+			mlog.Critical(fmt.Sprintf("Failed to create column %v", err))
+			time.Sleep(time.Second)
+			os.Exit(EXIT_CREATE_COLUMN_POSTGRES)
+		}
+
+		return true
+
+	} else if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
+		_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " ADD " + columnName + " " + mySqlColType)
 		if err != nil {
 			mlog.Critical(fmt.Sprintf("Failed to create column %v", err))
 			time.Sleep(time.Second)
@@ -765,6 +801,14 @@ func (ss *SqlSupplier) Close() {
 	}
 }
 
+func (ss *SqlSupplier) LockToMaster() {
+	ss.lockedToMaster = true
+}
+
+func (ss *SqlSupplier) UnlockFromMaster() {
+	ss.lockedToMaster = false
+}
+
 func (ss *SqlSupplier) Team() store.TeamStore {
 	return ss.oldStores.team
 }
@@ -863,6 +907,10 @@ func (ss *SqlSupplier) Plugin() store.PluginStore {
 
 func (ss *SqlSupplier) Role() store.RoleStore {
 	return ss.oldStores.role
+}
+
+func (ss *SqlSupplier) Scheme() store.SchemeStore {
+	return ss.oldStores.scheme
 }
 
 func (ss *SqlSupplier) DropAllTables() {

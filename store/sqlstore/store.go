@@ -52,6 +52,7 @@ type SqlStore interface {
 	DoesTableExist(tablename string) bool
 	DoesColumnExist(tableName string, columName string) bool
 	CreateColumnIfNotExists(tableName string, columnName string, mySqlColType string, postgresColType string, defaultValue string) bool
+	CreateColumnIfNotExistsNoDefault(tableName string, columnName string, mySqlColType string, postgresColType string) bool
 	RemoveColumnIfExists(tableName string, columnName string) bool
 	RemoveTableIfExists(tableName string) bool
 	RenameColumnIfExists(tableName string, oldColumnName string, newColumnName string, colType string) bool
@@ -64,6 +65,8 @@ type SqlStore interface {
 	RemoveIndexIfExists(indexName string, tableName string) bool
 	GetAllConns() []*gorp.DbMap
 	Close()
+	LockToMaster()
+	UnlockFromMaster()
 	Team() store.TeamStore
 	Channel() store.ChannelStore
 	Post() store.PostStore
@@ -88,4 +91,5 @@ type SqlStore interface {
 	Plugin() store.PluginStore
 	UserAccessToken() store.UserAccessTokenStore
 	Role() store.RoleStore
+	Scheme() store.SchemeStore
 }

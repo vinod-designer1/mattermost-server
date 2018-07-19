@@ -11,6 +11,7 @@ import (
 
 	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/plugin"
 	"github.com/mattermost/mattermost-server/store"
 	"github.com/mattermost/mattermost-server/utils"
 )
@@ -32,7 +33,7 @@ func (a *App) CreateDefaultChannels(teamId string) ([]*model.Channel, *model.App
 	return channels, nil
 }
 
-func (a *App) JoinDefaultChannels(teamId string, user *model.User, channelRole string, userRequestorId string) *model.AppError {
+func (a *App) JoinDefaultChannels(teamId string, user *model.User, shouldBeAdmin bool, userRequestorId string) *model.AppError {
 	var err *model.AppError = nil
 
 	var requestor *model.User
@@ -52,7 +53,8 @@ func (a *App) JoinDefaultChannels(teamId string, user *model.User, channelRole s
 		cm := &model.ChannelMember{
 			ChannelId:   townSquare.Id,
 			UserId:      user.Id,
-			Roles:       channelRole,
+			SchemeUser:  true,
+			SchemeAdmin: shouldBeAdmin,
 			NotifyProps: model.GetDefaultChannelNotifyProps(),
 		}
 
@@ -85,7 +87,8 @@ func (a *App) JoinDefaultChannels(teamId string, user *model.User, channelRole s
 		cm := &model.ChannelMember{
 			ChannelId:   offTopic.Id,
 			UserId:      user.Id,
-			Roles:       channelRole,
+			SchemeUser:  true,
+			SchemeAdmin: shouldBeAdmin,
 			NotifyProps: model.GetDefaultChannelNotifyProps(),
 		}
 
@@ -156,6 +159,21 @@ func (a *App) CreateChannelWithUser(channel *model.Channel, userId string) (*mod
 	return rchannel, nil
 }
 
+// RenameChannel is used to rename the channel Name and the DisplayName fields
+func (a *App) RenameChannel(channel *model.Channel, newChannelName string, newDisplayName string) (*model.Channel, *model.AppError) {
+	channel.Name = newChannelName
+	if newDisplayName != "" {
+		channel.DisplayName = newDisplayName
+	}
+
+	newChannel, err := a.UpdateChannel(channel)
+	if err != nil {
+		return nil, err
+	}
+
+	return newChannel, nil
+}
+
 func (a *App) CreateChannel(channel *model.Channel, addMember bool) (*model.Channel, *model.AppError) {
 	if result := <-a.Srv.Store.Channel().Save(channel, *a.Config().TeamSettings.MaxChannelsPerTeam); result.Err != nil {
 		return nil, result.Err
@@ -166,7 +184,8 @@ func (a *App) CreateChannel(channel *model.Channel, addMember bool) (*model.Chan
 			cm := &model.ChannelMember{
 				ChannelId:   sc.Id,
 				UserId:      channel.CreatorId,
-				Roles:       model.CHANNEL_USER_ROLE_ID + " " + model.CHANNEL_ADMIN_ROLE_ID,
+				SchemeUser:  true,
+				SchemeAdmin: true,
 				NotifyProps: model.GetDefaultChannelNotifyProps(),
 			}
 
@@ -178,6 +197,16 @@ func (a *App) CreateChannel(channel *model.Channel, addMember bool) (*model.Chan
 			}
 
 			a.InvalidateCacheForUser(channel.CreatorId)
+		}
+
+		if a.PluginsReady() {
+			a.Go(func() {
+				pluginContext := &plugin.Context{}
+				a.Plugins.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+					hooks.ChannelHasBeenCreated(pluginContext, sc)
+					return true
+				}, plugin.ChannelHasBeenCreatedId)
+			})
 		}
 
 		return sc, nil
@@ -196,6 +225,16 @@ func (a *App) CreateDirectChannel(userId string, otherUserId string) (*model.Cha
 
 		a.InvalidateCacheForUser(userId)
 		a.InvalidateCacheForUser(otherUserId)
+
+		if a.PluginsReady() {
+			a.Go(func() {
+				pluginContext := &plugin.Context{}
+				a.Plugins.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+					hooks.ChannelHasBeenCreated(pluginContext, channel)
+					return true
+				}, plugin.ChannelHasBeenCreatedId)
+			})
+		}
 
 		message := model.NewWebSocketEvent(model.WEBSOCKET_EVENT_DIRECT_ADDED, "", channel.Id, "", nil)
 		message.Add("teammate_id", otherUserId)
@@ -322,7 +361,7 @@ func (a *App) createGroupChannel(userIds []string, creatorId string) (*model.Cha
 				UserId:      user.Id,
 				ChannelId:   group.Id,
 				NotifyProps: model.GetDefaultChannelNotifyProps(),
-				Roles:       model.CHANNEL_USER_ROLE_ID,
+				SchemeUser:  true,
 			}
 
 			if result := <-a.Srv.Store.Channel().SaveMember(cm); result.Err != nil {
@@ -337,6 +376,30 @@ func (a *App) createGroupChannel(userIds []string, creatorId string) (*model.Cha
 	}
 }
 
+func (a *App) GetGroupChannel(userIds []string) (*model.Channel, *model.AppError) {
+	if len(userIds) > model.CHANNEL_GROUP_MAX_USERS || len(userIds) < model.CHANNEL_GROUP_MIN_USERS {
+		return nil, model.NewAppError("GetGroupChannel", "api.channel.create_group.bad_size.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	var users []*model.User
+	if result := <-a.Srv.Store.User().GetProfileByIds(userIds, true); result.Err != nil {
+		return nil, result.Err
+	} else {
+		users = result.Data.([]*model.User)
+	}
+
+	if len(users) != len(userIds) {
+		return nil, model.NewAppError("GetGroupChannel", "api.channel.create_group.bad_user.app_error", nil, "user_ids="+model.ArrayToJson(userIds), http.StatusBadRequest)
+	}
+
+	channel, err := a.GetChannelByName(model.GetGroupNameFromUserIds(userIds), "")
+	if err != nil {
+		return nil, err
+	}
+
+	return channel, nil
+}
+
 func (a *App) UpdateChannel(channel *model.Channel) (*model.Channel, *model.AppError) {
 	if result := <-a.Srv.Store.Channel().Update(channel); result.Err != nil {
 		return nil, result.Err
@@ -349,6 +412,23 @@ func (a *App) UpdateChannel(channel *model.Channel) (*model.Channel, *model.AppE
 
 		return channel, nil
 	}
+}
+
+func (a *App) UpdateChannelScheme(channel *model.Channel) (*model.Channel, *model.AppError) {
+	var oldChannel *model.Channel
+	var err *model.AppError
+	if oldChannel, err = a.GetChannel(channel.Id); err != nil {
+		return nil, err
+	}
+
+	oldChannel.SchemeId = channel.SchemeId
+
+	newChannel, err := a.UpdateChannel(oldChannel)
+	if err != nil {
+		return nil, err
+	}
+
+	return newChannel, nil
 }
 
 func (a *App) UpdateChannelPrivacy(oldChannel *model.Channel, user *model.User) (*model.Channel, *model.AppError) {
@@ -366,18 +446,24 @@ func (a *App) UpdateChannelPrivacy(oldChannel *model.Channel, user *model.User) 
 			return channel, err
 		}
 
+		a.InvalidateCacheForChannel(channel)
+
+		messageWs := model.NewWebSocketEvent(model.WEBSOCKET_EVENT_CHANNEL_CONVERTED, channel.TeamId, "", "", nil)
+		messageWs.Add("channel_id", channel.Id)
+		a.Publish(messageWs)
+
 		return channel, nil
 	}
 }
 
 func (a *App) postChannelPrivacyMessage(user *model.User, channel *model.Channel) *model.AppError {
-	privacy := (map[string]string{
-		model.CHANNEL_OPEN:    "private_to_public",
-		model.CHANNEL_PRIVATE: "public_to_private",
+	message := (map[string]string{
+		model.CHANNEL_OPEN:    utils.T("api.channel.change_channel_privacy.private_to_public"),
+		model.CHANNEL_PRIVATE: utils.T("api.channel.change_channel_privacy.public_to_private"),
 	})[channel.Type]
 	post := &model.Post{
 		ChannelId: channel.Id,
-		Message:   utils.T("api.channel.change_channel_privacy." + privacy),
+		Message:   message,
 		Type:      model.POST_CHANGE_CHANNEL_PRIVACY,
 		UserId:    user.Id,
 		Props: model.StringInterface{
@@ -432,6 +518,39 @@ func (a *App) PatchChannel(channel *model.Channel, patch *model.ChannelPatch, us
 	return channel, err
 }
 
+func (a *App) GetSchemeRolesForChannel(channelId string) (string, string, *model.AppError) {
+	var channel *model.Channel
+	var err *model.AppError
+
+	if channel, err = a.GetChannel(channelId); err != nil {
+		return "", "", err
+	}
+
+	if channel.SchemeId != nil && len(*channel.SchemeId) != 0 {
+		if scheme, err := a.GetScheme(*channel.SchemeId); err != nil {
+			return "", "", err
+		} else {
+			return scheme.DefaultChannelUserRole, scheme.DefaultChannelAdminRole, nil
+		}
+	}
+
+	var team *model.Team
+
+	if team, err = a.GetTeam(channel.TeamId); err != nil {
+		return "", "", err
+	}
+
+	if team.SchemeId != nil && len(*team.SchemeId) != 0 {
+		if scheme, err := a.GetScheme(*team.SchemeId); err != nil {
+			return "", "", err
+		} else {
+			return scheme.DefaultChannelUserRole, scheme.DefaultChannelAdminRole, nil
+		}
+	}
+
+	return model.CHANNEL_USER_ROLE_ID, model.CHANNEL_ADMIN_ROLE_ID, nil
+}
+
 func (a *App) UpdateChannelMemberRoles(channelId string, userId string, newRoles string) (*model.ChannelMember, *model.AppError) {
 	var member *model.ChannelMember
 	var err *model.AppError
@@ -439,14 +558,66 @@ func (a *App) UpdateChannelMemberRoles(channelId string, userId string, newRoles
 		return nil, err
 	}
 
-	if err := a.CheckRolesExist(strings.Fields(newRoles)); err != nil {
+	schemeUserRole, schemeAdminRole, err := a.GetSchemeRolesForChannel(channelId)
+	if err != nil {
 		return nil, err
 	}
 
-	member.Roles = newRoles
+	var newExplicitRoles []string
+	member.SchemeUser = false
+	member.SchemeAdmin = false
+
+	for _, roleName := range strings.Fields(newRoles) {
+		if role, err := a.GetRoleByName(roleName); err != nil {
+			err.StatusCode = http.StatusBadRequest
+			return nil, err
+		} else if !role.SchemeManaged {
+			// The role is not scheme-managed, so it's OK to apply it to the explicit roles field.
+			newExplicitRoles = append(newExplicitRoles, roleName)
+		} else {
+			// The role is scheme-managed, so need to check if it is part of the scheme for this channel or not.
+			switch roleName {
+			case schemeAdminRole:
+				member.SchemeAdmin = true
+			case schemeUserRole:
+				member.SchemeUser = true
+			default:
+				// If not part of the scheme for this channel, then it is not allowed to apply it as an explicit role.
+				return nil, model.NewAppError("UpdateChannelMemberRoles", "api.channel.update_channel_member_roles.scheme_role.app_error", nil, "role_name="+roleName, http.StatusBadRequest)
+			}
+		}
+	}
+
+	member.ExplicitRoles = strings.Join(newExplicitRoles, " ")
 
 	if result := <-a.Srv.Store.Channel().UpdateMember(member); result.Err != nil {
 		return nil, result.Err
+	} else {
+		member = result.Data.(*model.ChannelMember)
+	}
+
+	a.InvalidateCacheForUser(userId)
+	return member, nil
+}
+
+func (a *App) UpdateChannelMemberSchemeRoles(channelId string, userId string, isSchemeUser bool, isSchemeAdmin bool) (*model.ChannelMember, *model.AppError) {
+	member, err := a.GetChannelMember(channelId, userId)
+	if err != nil {
+		return nil, err
+	}
+
+	member.SchemeAdmin = isSchemeAdmin
+	member.SchemeUser = isSchemeUser
+
+	// If the migration is not completed, we also need to check the default channel_admin/channel_user roles are not present in the roles field.
+	if err = a.IsPhase2MigrationCompleted(); err != nil {
+		member.ExplicitRoles = RemoveRoles([]string{model.CHANNEL_USER_ROLE_ID, model.CHANNEL_ADMIN_ROLE_ID}, member.ExplicitRoles)
+	}
+
+	if result := <-a.Srv.Store.Channel().UpdateMember(member); result.Err != nil {
+		return nil, result.Err
+	} else {
+		member = result.Data.(*model.ChannelMember)
 	}
 
 	a.InvalidateCacheForUser(userId)
@@ -591,7 +762,7 @@ func (a *App) addUserToChannel(user *model.User, channel *model.Channel, teamMem
 		ChannelId:   channel.Id,
 		UserId:      user.Id,
 		NotifyProps: model.GetDefaultChannelNotifyProps(),
-		Roles:       model.CHANNEL_USER_ROLE_ID,
+		SchemeUser:  true,
 	}
 	if result := <-a.Srv.Store.Channel().SaveMember(newMember); result.Err != nil {
 		mlog.Error(fmt.Sprintf("Failed to add member user_id=%v channel_id=%v err=%v", user.Id, channel.Id, result.Err), mlog.String("user_id", user.Id))
@@ -661,6 +832,16 @@ func (a *App) AddChannelMember(userId string, channel *model.Channel, userReques
 	cm, err := a.AddUserToChannel(user, channel)
 	if err != nil {
 		return nil, err
+	}
+
+	if a.PluginsReady() {
+		a.Go(func() {
+			pluginContext := &plugin.Context{}
+			a.Plugins.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+				hooks.UserHasJoinedChannel(pluginContext, cm, userRequestor)
+				return true
+			}, plugin.UserHasJoinedChannelId)
+		})
 	}
 
 	if userRequestorId == "" || userId == userRequestorId {
@@ -993,8 +1174,19 @@ func (a *App) JoinChannel(channel *model.Channel, userId string) *model.AppError
 		user := uresult.Data.(*model.User)
 
 		if channel.Type == model.CHANNEL_OPEN {
-			if _, err := a.AddUserToChannel(user, channel); err != nil {
+			cm, err := a.AddUserToChannel(user, channel)
+			if err != nil {
 				return err
+			}
+
+			if a.PluginsReady() {
+				a.Go(func() {
+					pluginContext := &plugin.Context{}
+					a.Plugins.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+						hooks.UserHasJoinedChannel(pluginContext, cm, nil)
+						return true
+					}, plugin.UserHasJoinedChannelId)
+				})
 			}
 
 			if err := a.postJoinChannelMessage(user, channel); err != nil {
@@ -1177,6 +1369,11 @@ func (a *App) removeUserFromChannel(userIdToRemove string, removerUserId string,
 		return model.NewAppError("RemoveUserFromChannel", "api.channel.remove.default.app_error", map[string]interface{}{"Channel": model.DEFAULT_CHANNEL}, "", http.StatusBadRequest)
 	}
 
+	cm, err := a.GetChannelMember(channel.Id, userIdToRemove)
+	if err != nil {
+		return err
+	}
+
 	if cmresult := <-a.Srv.Store.Channel().RemoveMember(channel.Id, userIdToRemove); cmresult.Err != nil {
 		return cmresult.Err
 	}
@@ -1186,6 +1383,22 @@ func (a *App) removeUserFromChannel(userIdToRemove string, removerUserId string,
 
 	a.InvalidateCacheForUser(userIdToRemove)
 	a.InvalidateCacheForChannelMembers(channel.Id)
+
+	if a.PluginsReady() {
+
+		var actorUser *model.User
+		if removerUserId != "" {
+			actorUser, err = a.GetUser(removerUserId)
+		}
+
+		a.Go(func() {
+			pluginContext := &plugin.Context{}
+			a.Plugins.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+				hooks.UserHasLeftChannel(pluginContext, cm, actorUser)
+				return true
+			}, plugin.UserHasLeftChannelId)
+		})
+	}
 
 	message := model.NewWebSocketEvent(model.WEBSOCKET_EVENT_USER_REMOVED, "", channel.Id, "", nil)
 	message.Add("user_id", userIdToRemove)
@@ -1203,6 +1416,7 @@ func (a *App) removeUserFromChannel(userIdToRemove string, removerUserId string,
 
 func (a *App) RemoveUserFromChannel(userIdToRemove string, removerUserId string, channel *model.Channel) *model.AppError {
 	var err *model.AppError
+
 	if err = a.removeUserFromChannel(userIdToRemove, removerUserId, channel); err != nil {
 		return err
 	}
@@ -1215,6 +1429,11 @@ func (a *App) RemoveUserFromChannel(userIdToRemove string, removerUserId string,
 	if userIdToRemove == removerUserId {
 		a.postLeaveChannelMessage(user, channel)
 	} else {
+
+		if err != nil {
+			return err
+		}
+
 		a.Go(func() {
 			a.postRemoveFromChannelMessage(removerUserId, user, channel)
 		})
@@ -1479,4 +1698,68 @@ func (a *App) ToggleMuteChannel(channelId string, userId string) *model.ChannelM
 
 	a.Srv.Store.Channel().UpdateMember(member)
 	return member
+}
+
+func (a *App) FillInChannelProps(channel *model.Channel) *model.AppError {
+	return a.FillInChannelsProps(&model.ChannelList{channel})
+}
+
+func (a *App) FillInChannelsProps(channelList *model.ChannelList) *model.AppError {
+	// Group the channels by team and call GetChannelsByNames just once per team.
+	channelsByTeam := make(map[string]model.ChannelList)
+	for _, channel := range *channelList {
+		channelsByTeam[channel.TeamId] = append(channelsByTeam[channel.TeamId], channel)
+	}
+
+	for teamId, channelList := range channelsByTeam {
+		allChannelMentions := make(map[string]bool)
+		channelMentions := make(map[*model.Channel][]string, len(channelList))
+
+		// Collect mentions across the channels so as to query just once for this team.
+		for _, channel := range channelList {
+			channelMentions[channel] = model.ChannelMentions(channel.Header)
+
+			for _, channelMention := range channelMentions[channel] {
+				allChannelMentions[channelMention] = true
+			}
+		}
+
+		allChannelMentionNames := make([]string, 0, len(allChannelMentions))
+		for channelName := range allChannelMentions {
+			allChannelMentionNames = append(allChannelMentionNames, channelName)
+		}
+
+		if len(allChannelMentionNames) > 0 {
+			mentionedChannels, err := a.GetChannelsByNames(allChannelMentionNames, teamId)
+			if err != nil {
+				return err
+			}
+
+			mentionedChannelsByName := make(map[string]*model.Channel)
+			for _, channel := range mentionedChannels {
+				mentionedChannelsByName[channel.Name] = channel
+			}
+
+			for _, channel := range channelList {
+				channelMentionsProp := make(map[string]interface{}, len(channelMentions[channel]))
+				for _, channelMention := range channelMentions[channel] {
+					if mentioned, ok := mentionedChannelsByName[channelMention]; ok {
+						if mentioned.Type == model.CHANNEL_OPEN {
+							channelMentionsProp[mentioned.Name] = map[string]interface{}{
+								"display_name": mentioned.DisplayName,
+							}
+						}
+					}
+				}
+
+				if len(channelMentionsProp) > 0 {
+					channel.AddProp("channel_mentions", channelMentionsProp)
+				} else if channel.Props != nil {
+					delete(channel.Props, "channel_mentions")
+				}
+			}
+		}
+	}
+
+	return nil
 }

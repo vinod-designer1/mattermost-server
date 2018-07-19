@@ -228,27 +228,105 @@ func TestGetEnvironmentConfig(t *testing.T) {
 func TestGetOldClientConfig(t *testing.T) {
 	th := Setup().InitBasic().InitSystemAdmin()
 	defer th.TearDown()
-	Client := th.Client
 
-	config, resp := Client.GetOldClientConfig("")
-	CheckNoError(t, resp)
+	testKey := "supersecretkey"
+	th.App.UpdateConfig(func(cfg *model.Config) { cfg.ServiceSettings.GoogleDeveloperKey = testKey })
 
-	if len(config["Version"]) == 0 {
-		t.Fatal("config not returned correctly")
-	}
+	t.Run("with session, without limited config", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			cfg.ServiceSettings.GoogleDeveloperKey = testKey
+			*cfg.ServiceSettings.ExperimentalLimitClientConfig = false
+		})
 
-	Client.Logout()
+		Client := th.Client
 
-	_, resp = Client.GetOldClientConfig("")
-	CheckNoError(t, resp)
+		config, resp := Client.GetOldClientConfig("")
+		CheckNoError(t, resp)
 
-	if _, err := Client.DoApiGet("/config/client", ""); err == nil || err.StatusCode != http.StatusNotImplemented {
-		t.Fatal("should have errored with 501")
-	}
+		if len(config["Version"]) == 0 {
+			t.Fatal("config not returned correctly")
+		}
 
-	if _, err := Client.DoApiGet("/config/client?format=junk", ""); err == nil || err.StatusCode != http.StatusBadRequest {
-		t.Fatal("should have errored with 400")
-	}
+		if config["GoogleDeveloperKey"] != testKey {
+			t.Fatal("config missing developer key")
+		}
+	})
+
+	t.Run("without session, without limited config", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			cfg.ServiceSettings.GoogleDeveloperKey = testKey
+			*cfg.ServiceSettings.ExperimentalLimitClientConfig = false
+		})
+
+		Client := th.CreateClient()
+
+		config, resp := Client.GetOldClientConfig("")
+		CheckNoError(t, resp)
+
+		if len(config["Version"]) == 0 {
+			t.Fatal("config not returned correctly")
+		}
+
+		if config["GoogleDeveloperKey"] != testKey {
+			t.Fatal("config missing developer key")
+		}
+	})
+
+	t.Run("with session, with limited config", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			cfg.ServiceSettings.GoogleDeveloperKey = testKey
+			*cfg.ServiceSettings.ExperimentalLimitClientConfig = true
+		})
+
+		Client := th.Client
+
+		config, resp := Client.GetOldClientConfig("")
+		CheckNoError(t, resp)
+
+		if len(config["Version"]) == 0 {
+			t.Fatal("config not returned correctly")
+		}
+
+		if config["GoogleDeveloperKey"] != testKey {
+			t.Fatal("config missing developer key")
+		}
+	})
+
+	t.Run("without session, without limited config", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			cfg.ServiceSettings.GoogleDeveloperKey = testKey
+			*cfg.ServiceSettings.ExperimentalLimitClientConfig = true
+		})
+
+		Client := th.CreateClient()
+
+		config, resp := Client.GetOldClientConfig("")
+		CheckNoError(t, resp)
+
+		if len(config["Version"]) == 0 {
+			t.Fatal("config not returned correctly")
+		}
+
+		if _, ok := config["GoogleDeveloperKey"]; ok {
+			t.Fatal("config should be missing developer key")
+		}
+	})
+
+	t.Run("missing format", func(t *testing.T) {
+		Client := th.Client
+
+		if _, err := Client.DoApiGet("/config/client", ""); err == nil || err.StatusCode != http.StatusNotImplemented {
+			t.Fatal("should have errored with 501")
+		}
+	})
+
+	t.Run("invalid format", func(t *testing.T) {
+		Client := th.Client
+
+		if _, err := Client.DoApiGet("/config/client?format=junk", ""); err == nil || err.StatusCode != http.StatusBadRequest {
+			t.Fatal("should have errored with 400")
+		}
+	})
 }
 
 func TestGetOldClientLicense(t *testing.T) {
@@ -512,15 +590,18 @@ func TestGetAnalyticsOld(t *testing.T) {
 	CheckNoError(t, resp)
 
 	found := false
+	found2 := false
 	for _, row := range rows {
 		if row.Name == "unique_user_count" {
 			found = true
+		} else if row.Name == "inactive_user_count" {
+			found2 = true
+			assert.True(t, row.Value >= 0)
 		}
 	}
 
-	if !found {
-		t.Fatal("should return unique user count")
-	}
+	assert.True(t, found, "should return unique user count")
+	assert.True(t, found2, "should return inactive user count")
 
 	_, resp = th.SystemAdminClient.GetAnalyticsOld("post_counts_day", "")
 	CheckNoError(t, resp)
@@ -531,8 +612,14 @@ func TestGetAnalyticsOld(t *testing.T) {
 	_, resp = th.SystemAdminClient.GetAnalyticsOld("extra_counts", "")
 	CheckNoError(t, resp)
 
-	_, resp = th.SystemAdminClient.GetAnalyticsOld("", th.BasicTeam.Id)
+	rows, resp = th.SystemAdminClient.GetAnalyticsOld("", th.BasicTeam.Id)
 	CheckNoError(t, resp)
+
+	for _, row := range rows {
+		if row.Name == "inactive_user_count" {
+			assert.Equal(t, float64(-1), row.Value, "inactive user count should be -1 when team specified")
+		}
+	}
 
 	rows2, resp2 := th.SystemAdminClient.GetAnalyticsOld("standard", "")
 	CheckNoError(t, resp2)
@@ -609,9 +696,12 @@ func TestS3TestConnection(t *testing.T) {
 	config.FileSettings.AmazonS3Bucket = "Wrong_bucket"
 	_, resp = th.SystemAdminClient.TestS3Connection(&config)
 	CheckInternalErrorStatus(t, resp)
-	if resp.Error.Message != "Error checking if bucket exists." {
-		t.Fatal("should return error ")
-	}
+	assert.Equal(t, "Unable to create bucket.", resp.Error.Message)
+
+	config.FileSettings.AmazonS3Bucket = "shouldcreatenewbucket"
+	_, resp = th.SystemAdminClient.TestS3Connection(&config)
+	CheckOKStatus(t, resp)
+
 }
 
 func TestSupportedTimezones(t *testing.T) {
