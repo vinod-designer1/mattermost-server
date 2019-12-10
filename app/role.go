@@ -1,5 +1,5 @@
-// Copyright (c) 2018-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package app
 
@@ -8,31 +8,23 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/v5/model"
 )
 
 func (a *App) GetRole(id string) (*model.Role, *model.AppError) {
-	if result := <-a.Srv.Store.Role().Get(id); result.Err != nil {
-		return nil, result.Err
-	} else {
-		return result.Data.(*model.Role), nil
-	}
+	return a.Srv.Store.Role().Get(id)
+}
+
+func (a *App) GetAllRoles() ([]*model.Role, *model.AppError) {
+	return a.Srv.Store.Role().GetAll()
 }
 
 func (a *App) GetRoleByName(name string) (*model.Role, *model.AppError) {
-	if result := <-a.Srv.Store.Role().GetByName(name); result.Err != nil {
-		return nil, result.Err
-	} else {
-		return result.Data.(*model.Role), nil
-	}
+	return a.Srv.Store.Role().GetByName(name)
 }
 
 func (a *App) GetRolesByNames(names []string) ([]*model.Role, *model.AppError) {
-	if result := <-a.Srv.Store.Role().GetByNames(names); result.Err != nil {
-		return nil, result.Err
-	} else {
-		return result.Data.([]*model.Role), nil
-	}
+	return a.Srv.Store.Role().GetByNames(names)
 }
 
 func (a *App) PatchRole(role *model.Role, patch *model.RolePatch) (*model.Role, *model.AppError) {
@@ -58,21 +50,19 @@ func (a *App) CreateRole(role *model.Role) (*model.Role, *model.AppError) {
 	role.BuiltIn = false
 	role.SchemeManaged = false
 
-	if result := <-a.Srv.Store.Role().Save(role); result.Err != nil {
-		return nil, result.Err
-	} else {
-		return result.Data.(*model.Role), nil
-	}
+	return a.Srv.Store.Role().Save(role)
+
 }
 
 func (a *App) UpdateRole(role *model.Role) (*model.Role, *model.AppError) {
-	if result := <-a.Srv.Store.Role().Save(role); result.Err != nil {
-		return nil, result.Err
-	} else {
-		a.sendUpdatedRoleEvent(role)
-
-		return role, nil
+	savedRole, err := a.Srv.Store.Role().Save(role)
+	if err != nil {
+		return nil, err
 	}
+	a.sendUpdatedRoleEvent(savedRole)
+
+	return savedRole, nil
+
 }
 
 func (a *App) CheckRolesExist(roleNames []string) *model.AppError {
@@ -101,7 +91,7 @@ func (a *App) sendUpdatedRoleEvent(role *model.Role) {
 	message := model.NewWebSocketEvent(model.WEBSOCKET_EVENT_ROLE_UPDATED, "", "", "", nil)
 	message.Add("role", role.ToJson())
 
-	a.Go(func() {
+	a.Srv.Go(func() {
 		a.Publish(message)
 	})
 }

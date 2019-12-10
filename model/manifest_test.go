@@ -1,5 +1,5 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package model
 
@@ -63,7 +63,11 @@ func TestFindManifest(t *testing.T) {
 
 func TestManifestUnmarshal(t *testing.T) {
 	expected := Manifest{
-		Id: "theid",
+		Id:               "theid",
+		HomepageURL:      "https://example.com",
+		SupportURL:       "https://example.com/support",
+		IconPath:         "assets/icon.svg",
+		MinServerVersion: "5.6.0",
 		Server: &ManifestServer{
 			Executable: "theexecutable",
 			Executables: &ManifestExecutables{
@@ -79,7 +83,7 @@ func TestManifestUnmarshal(t *testing.T) {
 			Header: "theheadertext",
 			Footer: "thefootertext",
 			Settings: []*PluginSetting{
-				&PluginSetting{
+				{
 					Key:                "thesetting",
 					DisplayName:        "thedisplayname",
 					Type:               "dropdown",
@@ -87,7 +91,7 @@ func TestManifestUnmarshal(t *testing.T) {
 					RegenerateHelpText: "theregeneratehelptext",
 					Placeholder:        "theplaceholder",
 					Options: []*PluginOption{
-						&PluginOption{
+						{
 							DisplayName: "theoptiondisplayname",
 							Value:       "thevalue",
 						},
@@ -101,6 +105,10 @@ func TestManifestUnmarshal(t *testing.T) {
 	var yamlResult Manifest
 	require.NoError(t, yaml.Unmarshal([]byte(`
 id: theid
+homepage_url: https://example.com
+support_url: https://example.com/support
+icon_path: assets/icon.svg
+min_server_version: 5.6.0
 server:
     executable: theexecutable
     executables:
@@ -129,6 +137,10 @@ settings_schema:
 	var jsonResult Manifest
 	require.NoError(t, json.Unmarshal([]byte(`{
 	"id": "theid",
+	"homepage_url": "https://example.com",
+	"support_url": "https://example.com/support",
+	"icon_path": "assets/icon.svg",
+	"min_server_version": "5.6.0",
 	"server": {
 		"executable": "theexecutable",
 		"executables": {
@@ -182,6 +194,31 @@ func TestFindManifest_FileErrors(t *testing.T) {
 	}
 }
 
+func TestFindManifest_FolderPermission(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("skipping test while running as root: can't effectively remove permissions")
+	}
+
+	for _, tc := range []string{"plugin.yaml", "plugin.json"} {
+		dir, err := ioutil.TempDir("", "mm-plugin-test")
+		require.NoError(t, err)
+		defer os.RemoveAll(dir)
+
+		path := filepath.Join(dir, tc)
+		require.NoError(t, os.Mkdir(path, 0700))
+
+		// User does not have permission in the plugin folder
+		err = os.Chmod(dir, 0066)
+		require.NoError(t, err)
+
+		m, mpath, err := FindManifest(dir)
+		assert.Nil(t, m)
+		assert.Equal(t, "", mpath)
+		assert.Error(t, err, tc)
+		assert.False(t, os.IsNotExist(err), tc)
+	}
+}
+
 func TestManifestJson(t *testing.T) {
 	manifest := &Manifest{
 		Id: "theid",
@@ -195,7 +232,7 @@ func TestManifestJson(t *testing.T) {
 			Header: "theheadertext",
 			Footer: "thefootertext",
 			Settings: []*PluginSetting{
-				&PluginSetting{
+				{
 					Key:                "thesetting",
 					DisplayName:        "thedisplayname",
 					Type:               "dropdown",
@@ -203,7 +240,7 @@ func TestManifestJson(t *testing.T) {
 					RegenerateHelpText: "theregeneratehelptext",
 					Placeholder:        "theplaceholder",
 					Options: []*PluginOption{
-						&PluginOption{
+						{
 							DisplayName: "theoptiondisplayname",
 							Value:       "thevalue",
 						},
@@ -246,21 +283,23 @@ func TestManifestHasClient(t *testing.T) {
 
 func TestManifestClientManifest(t *testing.T) {
 	manifest := &Manifest{
-		Id:          "theid",
-		Name:        "thename",
-		Description: "thedescription",
-		Version:     "0.0.1",
+		Id:               "theid",
+		Name:             "thename",
+		Description:      "thedescription",
+		Version:          "0.0.1",
+		MinServerVersion: "5.6.0",
 		Server: &ManifestServer{
 			Executable: "theexecutable",
 		},
 		Webapp: &ManifestWebapp{
 			BundlePath: "thebundlepath",
+			BundleHash: []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
 		},
 		SettingsSchema: &PluginSettingsSchema{
 			Header: "theheadertext",
 			Footer: "thefootertext",
 			Settings: []*PluginSetting{
-				&PluginSetting{
+				{
 					Key:                "thesetting",
 					DisplayName:        "thedisplayname",
 					Type:               "dropdown",
@@ -268,7 +307,7 @@ func TestManifestClientManifest(t *testing.T) {
 					RegenerateHelpText: "theregeneratehelptext",
 					Placeholder:        "theplaceholder",
 					Options: []*PluginOption{
-						&PluginOption{
+						{
 							DisplayName: "theoptiondisplayname",
 							Value:       "thevalue",
 						},
@@ -281,16 +320,19 @@ func TestManifestClientManifest(t *testing.T) {
 
 	sanitized := manifest.ClientManifest()
 
-	assert.NotEmpty(t, sanitized.Id)
-	assert.NotEmpty(t, sanitized.Version)
-	assert.NotEmpty(t, sanitized.Webapp)
-	assert.NotEmpty(t, sanitized.SettingsSchema)
+	assert.Equal(t, manifest.Id, sanitized.Id)
+	assert.Equal(t, manifest.Version, sanitized.Version)
+	assert.Equal(t, manifest.MinServerVersion, sanitized.MinServerVersion)
+	assert.Equal(t, "/static/theid/theid_000102030405060708090a0b0c0d0e0f_bundle.js", sanitized.Webapp.BundlePath)
+	assert.Equal(t, manifest.Webapp.BundleHash, sanitized.Webapp.BundleHash)
+	assert.Equal(t, manifest.SettingsSchema, sanitized.SettingsSchema)
 	assert.Empty(t, sanitized.Name)
 	assert.Empty(t, sanitized.Description)
 	assert.Empty(t, sanitized.Server)
 
 	assert.NotEmpty(t, manifest.Id)
 	assert.NotEmpty(t, manifest.Version)
+	assert.NotEmpty(t, manifest.MinServerVersion)
 	assert.NotEmpty(t, manifest.Webapp)
 	assert.NotEmpty(t, manifest.Name)
 	assert.NotEmpty(t, manifest.Description)
@@ -589,6 +631,56 @@ func TestManifestHasWebapp(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.Description, func(t *testing.T) {
 			assert.Equal(t, testCase.Expected, testCase.Manifest.HasWebapp())
+		})
+	}
+}
+
+func TestManifestMeetMinServerVersion(t *testing.T) {
+	for name, test := range map[string]struct {
+		MinServerVersion string
+		ServerVersion    string
+		ShouldError      bool
+		ShouldFulfill    bool
+	}{
+		"generously fulfilled": {
+			MinServerVersion: "5.5.0",
+			ServerVersion:    "5.6.0",
+			ShouldError:      false,
+			ShouldFulfill:    true,
+		},
+		"exactly fulfilled": {
+			MinServerVersion: "5.6.0",
+			ServerVersion:    "5.6.0",
+			ShouldError:      false,
+			ShouldFulfill:    true,
+		},
+		"not fulfilled": {
+			MinServerVersion: "5.6.0",
+			ServerVersion:    "5.5.0",
+			ShouldError:      false,
+			ShouldFulfill:    false,
+		},
+		"fail to parse MinServerVersion": {
+			MinServerVersion: "abc",
+			ServerVersion:    "5.5.0",
+			ShouldError:      true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			manifest := Manifest{
+				MinServerVersion: test.MinServerVersion,
+			}
+			fulfilled, err := manifest.MeetMinServerVersion(test.ServerVersion)
+
+			if test.ShouldError {
+				assert.NotNil(err)
+				assert.False(fulfilled)
+				return
+			}
+			assert.Nil(err)
+			assert.Equal(test.ShouldFulfill, fulfilled)
 		})
 	}
 }

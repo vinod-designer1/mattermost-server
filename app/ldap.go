@@ -1,5 +1,5 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package app
 
@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
 func (a *App) SyncLdap() {
-	a.Go(func() {
+	a.Srv.Go(func() {
 
 		if license := a.License(); license != nil && *license.Features.LDAP && *a.Config().LdapSettings.EnableSync {
 			if ldapI := a.Ldap; ldapI != nil {
@@ -38,6 +38,46 @@ func (a *App) TestLdap() *model.AppError {
 	}
 
 	return nil
+}
+
+// GetLdapGroup retrieves a single LDAP group by the given LDAP group id.
+func (a *App) GetLdapGroup(ldapGroupID string) (*model.Group, *model.AppError) {
+	var group *model.Group
+
+	if a.Ldap != nil {
+		var err *model.AppError
+		group, err = a.Ldap.GetGroup(ldapGroupID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		ae := model.NewAppError("GetLdapGroup", "ent.ldap.app_error", nil, "", http.StatusNotImplemented)
+		mlog.Error("Unable to use ldap", mlog.String("ldap_group_id", ldapGroupID), mlog.Err(ae))
+		return nil, ae
+	}
+
+	return group, nil
+}
+
+// GetAllLdapGroupsPage retrieves all LDAP groups under the configured base DN using the default or configured group
+// filter.
+func (a *App) GetAllLdapGroupsPage(page int, perPage int, opts model.LdapGroupSearchOpts) ([]*model.Group, int, *model.AppError) {
+	var groups []*model.Group
+	var total int
+
+	if a.Ldap != nil {
+		var err *model.AppError
+		groups, total, err = a.Ldap.GetAllGroupsPage(page, perPage, opts)
+		if err != nil {
+			return nil, 0, err
+		}
+	} else {
+		ae := model.NewAppError("GetAllLdapGroupsPage", "ent.ldap.app_error", nil, "", http.StatusNotImplemented)
+		mlog.Error("Unable to use ldap", mlog.Err(ae))
+		return nil, 0, ae
+	}
+
+	return groups, total, nil
 }
 
 func (a *App) SwitchEmailToLdap(email, password, code, ldapLoginId, ldapPassword string) (string, *model.AppError) {
@@ -67,7 +107,7 @@ func (a *App) SwitchEmailToLdap(email, password, code, ldapLoginId, ldapPassword
 		return "", err
 	}
 
-	a.Go(func() {
+	a.Srv.Go(func() {
 		if err := a.SendSignInChangeEmail(user.Email, "AD/LDAP", user.Locale, a.GetSiteURL()); err != nil {
 			mlog.Error(err.Error())
 		}
@@ -113,7 +153,7 @@ func (a *App) SwitchLdapToEmail(ldapPassword, code, email, newPassword string) (
 
 	T := utils.GetUserTranslations(user.Locale)
 
-	a.Go(func() {
+	a.Srv.Go(func() {
 		if err := a.SendSignInChangeEmail(user.Email, T("api.templates.signin_change_email.body.method_email"), user.Locale, a.GetSiteURL()); err != nil {
 			mlog.Error(err.Error())
 		}

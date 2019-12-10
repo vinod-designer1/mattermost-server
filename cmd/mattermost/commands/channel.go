@@ -1,14 +1,14 @@
-// Copyright (c) 2016-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package commands
 
 import (
-	"errors"
 	"fmt"
 
-	"github.com/mattermost/mattermost-server/app"
-	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/v5/app"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -31,15 +31,17 @@ var ChannelRenameCmd = &cobra.Command{
 	Short:   "Rename a channel",
 	Long:    `Rename a channel.`,
 	Example: `"  channel rename myteam:mychannel newchannelname --display_name "New Display Name"`,
+	Args:    cobra.MinimumNArgs(2),
 	RunE:    renameChannelCmdF,
 }
 
 var RemoveChannelUsersCmd = &cobra.Command{
-	Use:     "remove [channel] [users]",
-	Short:   "Remove users from channel",
-	Long:    "Remove some users from channel",
-	Example: "  channel remove myteam:mychannel user@example.com username",
-	RunE:    removeChannelUsersCmdF,
+	Use:   "remove [channel] [users]",
+	Short: "Remove users from channel",
+	Long:  "Remove some users from channel",
+	Example: `  channel remove myteam:mychannel user@example.com username
+  channel remove myteam:mychannel --all-users`,
+	RunE: removeChannelUsersCmdF,
 }
 
 var AddChannelUsersCmd = &cobra.Command{
@@ -47,6 +49,7 @@ var AddChannelUsersCmd = &cobra.Command{
 	Short:   "Add users to channel",
 	Long:    "Add some users to channel",
 	Example: "  channel add myteam:mychannel user@example.com username",
+	Args:    cobra.MinimumNArgs(2),
 	RunE:    addChannelUsersCmdF,
 }
 
@@ -57,6 +60,7 @@ var ArchiveChannelsCmd = &cobra.Command{
 Archive a channel along with all related information including posts from the database.
 Channels can be specified by [team]:[channel]. ie. myteam:mychannel or by channel ID.`,
 	Example: "  channel archive myteam:mychannel",
+	Args:    cobra.MinimumNArgs(1),
 	RunE:    archiveChannelsCmdF,
 }
 
@@ -67,6 +71,7 @@ var DeleteChannelsCmd = &cobra.Command{
 Permanently deletes a channel along with all related information including posts from the database.
 Channels can be specified by [team]:[channel]. ie. myteam:mychannel or by channel ID.`,
 	Example: "  channel delete myteam:mychannel",
+	Args:    cobra.MinimumNArgs(1),
 	RunE:    deleteChannelsCmdF,
 }
 
@@ -74,18 +79,21 @@ var ListChannelsCmd = &cobra.Command{
 	Use:   "list [teams]",
 	Short: "List all channels on specified teams.",
 	Long: `List all channels on specified teams.
-Archived channels are appended with ' (archived)'.`,
+Archived channels are appended with ' (archived)'.
+Private channels are appended with ' (private)'.`,
 	Example: "  channel list myteam",
+	Args:    cobra.MinimumNArgs(1),
 	RunE:    listChannelsCmdF,
 }
 
 var MoveChannelsCmd = &cobra.Command{
-	Use:   "move [team] [channels]",
+	Use:   "move [team] [channels] --username [user]",
 	Short: "Moves channels to the specified team",
 	Long: `Moves the provided channels to the specified team.
 Validates that all users in the channel belong to the target team. Incoming/Outgoing webhooks are moved along with the channel.
 Channels can be specified by [team]:[channel]. ie. myteam:mychannel or by channel ID.`,
-	Example: "  channel move newteam oldteam:mychannel",
+	Example: "  channel move newteam oldteam:mychannel --username myusername",
+	Args:    cobra.MinimumNArgs(2),
 	RunE:    moveChannelsCmdF,
 }
 
@@ -95,16 +103,29 @@ var RestoreChannelsCmd = &cobra.Command{
 	Long: `Restore a previously deleted channel
 Channels can be specified by [team]:[channel]. ie. myteam:mychannel or by channel ID.`,
 	Example: "  channel restore myteam:mychannel",
+	Args:    cobra.MinimumNArgs(1),
 	RunE:    restoreChannelsCmdF,
 }
 
 var ModifyChannelCmd = &cobra.Command{
-	Use:   "modify [channel]",
+	Use:   "modify [channel] [flags] --username [user]",
 	Short: "Modify a channel's public/private type",
 	Long: `Change the public/private type of a channel.
 Channel can be specified by [team]:[channel]. ie. myteam:mychannel or by channel ID.`,
-	Example: "  channel modify myteam:mychannel --private",
+	Example: "  channel modify myteam:mychannel --private --username myusername",
+	Args:    cobra.MinimumNArgs(1),
 	RunE:    modifyChannelCmdF,
+}
+
+var SearchChannelCmd = &cobra.Command{
+	Use:   "search [channel]\n  mattermost search --team [team] [channel]",
+	Short: "Search a channel",
+	Long: `Search a channel by channel name.
+Channel can be specified by team. ie. --team myTeam myChannel or by team ID.`,
+	Example: `  channel search myChannel
+  channel search --team myTeam myChannel`,
+	Args: cobra.ExactArgs(1),
+	RunE: searchChannelCmdF,
 }
 
 func init() {
@@ -116,6 +137,7 @@ func init() {
 	ChannelCreateCmd.Flags().Bool("private", false, "Create a private channel.")
 
 	MoveChannelsCmd.Flags().String("username", "", "Required. Username who is moving the channel.")
+	MoveChannelsCmd.Flags().Bool("remove-deactivated-users", false, "Automatically remove any deactivated users from the channel before moving it.")
 
 	DeleteChannelsCmd.Flags().Bool("confirm", false, "Confirm you really want to delete the channels.")
 
@@ -124,6 +146,9 @@ func init() {
 	ModifyChannelCmd.Flags().String("username", "", "Required. Username who changes the channel privacy.")
 
 	ChannelRenameCmd.Flags().String("display_name", "", "Channel Display Name")
+	SearchChannelCmd.Flags().String("team", "", "Team name or ID")
+
+	RemoveChannelUsersCmd.Flags().Bool("all-users", false, "Remove all users from the indicated channel.")
 
 	ChannelCmd.AddCommand(
 		ChannelCreateCmd,
@@ -136,6 +161,7 @@ func init() {
 		RestoreChannelsCmd,
 		ModifyChannelCmd,
 		ChannelRenameCmd,
+		SearchChannelCmd,
 	)
 
 	RootCmd.AddCommand(ChannelCmd)
@@ -184,10 +210,14 @@ func createChannelCmdF(command *cobra.Command, args []string) error {
 		CreatorId:   "",
 	}
 
-	if _, err := a.CreateChannel(channel, false); err != nil {
-		return err
+	createdChannel, errCreatedChannel := a.CreateChannel(channel, false)
+	if errCreatedChannel != nil {
+		return errCreatedChannel
 	}
 
+	CommandPrettyPrintln("Id: " + createdChannel.Id)
+	CommandPrettyPrintln("Name: " + createdChannel.Name)
+	CommandPrettyPrintln("Display Name: " + createdChannel.DisplayName)
 	return nil
 }
 
@@ -198,8 +228,14 @@ func removeChannelUsersCmdF(command *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	if len(args) < 2 {
-		return errors.New("Not enough arguments.")
+	allUsers, _ := command.Flags().GetBool("all-users")
+
+	if allUsers && len(args) != 1 {
+		return errors.New("individual users must not be specified in conjunction with the --all-users flag")
+	}
+
+	if !allUsers && len(args) < 2 {
+		return errors.New("you must specify some users to remove from the channel, or use the --all-users flag to remove them all")
 	}
 
 	channel := getChannelFromChannelArg(a, args[0])
@@ -207,9 +243,13 @@ func removeChannelUsersCmdF(command *cobra.Command, args []string) error {
 		return errors.New("Unable to find channel '" + args[0] + "'")
 	}
 
-	users := getUsersFromUserArgs(a, args[1:])
-	for i, user := range users {
-		removeUserFromChannel(a, channel, user, args[i+1])
+	if allUsers {
+		removeAllUsersFromChannel(a, channel)
+	} else {
+		users := getUsersFromUserArgs(a, args[1:])
+		for i, user := range users {
+			removeUserFromChannel(a, channel, user, args[i+1])
+		}
 	}
 
 	return nil
@@ -225,16 +265,18 @@ func removeUserFromChannel(a *app.App, channel *model.Channel, user *model.User,
 	}
 }
 
+func removeAllUsersFromChannel(a *app.App, channel *model.Channel) {
+	if err := a.Srv.Store.Channel().PermanentDeleteMembersByChannel(channel.Id); err != nil {
+		CommandPrintErrorln("Unable to remove all users from " + channel.Name + ". Error: " + err.Error())
+	}
+}
+
 func addChannelUsersCmdF(command *cobra.Command, args []string) error {
 	a, err := InitDBCommandContextCobra(command)
 	if err != nil {
 		return err
 	}
 	defer a.Shutdown()
-
-	if len(args) < 2 {
-		return errors.New("Not enough arguments.")
-	}
 
 	channel := getChannelFromChannelArg(a, args[0])
 	if channel == nil {
@@ -266,18 +308,14 @@ func archiveChannelsCmdF(command *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	if len(args) < 1 {
-		return errors.New("Enter at least one channel to archive.")
-	}
-
 	channels := getChannelsFromChannelArgs(a, args)
 	for i, channel := range channels {
 		if channel == nil {
 			CommandPrintErrorln("Unable to find channel '" + args[i] + "'")
 			continue
 		}
-		if result := <-a.Srv.Store.Channel().Delete(channel.Id, model.GetMillis()); result.Err != nil {
-			CommandPrintErrorln("Unable to archive channel '" + channel.Name + "' error: " + result.Err.Error())
+		if err := a.Srv.Store.Channel().Delete(channel.Id, model.GetMillis()); err != nil {
+			CommandPrintErrorln("Unable to archive channel '" + channel.Name + "' error: " + err.Error())
 		}
 	}
 
@@ -290,10 +328,6 @@ func deleteChannelsCmdF(command *cobra.Command, args []string) error {
 		return err
 	}
 	defer a.Shutdown()
-
-	if len(args) < 1 {
-		return errors.New("Enter at least one channel to delete.")
-	}
 
 	confirmFlag, _ := command.Flags().GetBool("confirm")
 	if !confirmFlag {
@@ -332,10 +366,6 @@ func moveChannelsCmdF(command *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	if len(args) < 2 {
-		return errors.New("Enter the destination team and at least one channel to move.")
-	}
-
 	team := getTeamFromTeamArg(a, args[0])
 	if team == nil {
 		return errors.New("Unable to find destination team '" + args[0] + "'")
@@ -343,9 +373,11 @@ func moveChannelsCmdF(command *cobra.Command, args []string) error {
 
 	username, erru := command.Flags().GetString("username")
 	if erru != nil || username == "" {
-		return errors.New("Username is required")
+		return errors.New("Username is required.")
 	}
 	user := getUserFromUserArg(a, username)
+
+	removeDeactivatedMembers, _ := command.Flags().GetBool("remove-deactivated-users")
 
 	channels := getChannelsFromChannelArgs(a, args[1:])
 	for i, channel := range channels {
@@ -354,7 +386,7 @@ func moveChannelsCmdF(command *cobra.Command, args []string) error {
 			continue
 		}
 		originTeamID := channel.TeamId
-		if err := moveChannel(a, team, channel, user); err != nil {
+		if err := moveChannel(a, team, channel, user, removeDeactivatedMembers); err != nil {
 			CommandPrintErrorln("Unable to move channel '" + channel.Name + "' error: " + err.Error())
 		} else {
 			CommandPrettyPrintln("Moved channel '" + channel.Name + "' to " + team.Name + "(" + team.Id + ") from " + originTeamID + ".")
@@ -364,10 +396,10 @@ func moveChannelsCmdF(command *cobra.Command, args []string) error {
 	return nil
 }
 
-func moveChannel(a *app.App, team *model.Team, channel *model.Channel, user *model.User) *model.AppError {
+func moveChannel(a *app.App, team *model.Team, channel *model.Channel, user *model.User, removeDeactivatedMembers bool) *model.AppError {
 	oldTeamId := channel.TeamId
 
-	if err := a.MoveChannel(team, channel, user); err != nil {
+	if err := a.MoveChannel(team, channel, user, removeDeactivatedMembers); err != nil {
 		return err
 	}
 
@@ -377,7 +409,7 @@ func moveChannel(a *app.App, team *model.Team, channel *model.Channel, user *mod
 		for _, webhook := range incomingWebhooks {
 			if webhook.ChannelId == channel.Id {
 				webhook.TeamId = team.Id
-				if result := <-a.Srv.Store.Webhook().UpdateIncoming(webhook); result.Err != nil {
+				if _, err := a.Srv.Store.Webhook().UpdateIncoming(webhook); err != nil {
 					CommandPrintErrorln("Failed to move incoming webhook '" + webhook.Id + "' to new team.")
 				}
 			}
@@ -390,7 +422,7 @@ func moveChannel(a *app.App, team *model.Team, channel *model.Channel, user *mod
 		for _, webhook := range outgoingWebhooks {
 			if webhook.ChannelId == channel.Id {
 				webhook.TeamId = team.Id
-				if result := <-a.Srv.Store.Webhook().UpdateOutgoing(webhook); result.Err != nil {
+				if _, err := a.Srv.Store.Webhook().UpdateOutgoing(webhook); err != nil {
 					CommandPrintErrorln("Failed to move outgoing webhook '" + webhook.Id + "' to new team.")
 				}
 			}
@@ -407,27 +439,24 @@ func listChannelsCmdF(command *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	if len(args) < 1 {
-		return errors.New("Enter at least one team.")
-	}
-
 	teams := getTeamsFromTeamArgs(a, args)
 	for i, team := range teams {
 		if team == nil {
 			CommandPrintErrorln("Unable to find team '" + args[i] + "'")
 			continue
 		}
-		if result := <-a.Srv.Store.Channel().GetAll(team.Id); result.Err != nil {
+		if channels, chanErr := a.Srv.Store.Channel().GetAll(team.Id); chanErr != nil {
 			CommandPrintErrorln("Unable to list channels for '" + args[i] + "'")
 		} else {
-			channels := result.Data.([]*model.Channel)
-
 			for _, channel := range channels {
+				output := channel.Name
 				if channel.DeleteAt > 0 {
-					CommandPrettyPrintln(channel.Name + " (archived)")
-				} else {
-					CommandPrettyPrintln(channel.Name)
+					output += " (archived)"
 				}
+				if channel.Type == model.CHANNEL_PRIVATE {
+					output += " (private)"
+				}
+				CommandPrettyPrintln(output)
 			}
 		}
 	}
@@ -442,17 +471,13 @@ func restoreChannelsCmdF(command *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	if len(args) < 1 {
-		return errors.New("Enter at least one channel.")
-	}
-
 	channels := getChannelsFromChannelArgs(a, args)
 	for i, channel := range channels {
 		if channel == nil {
 			CommandPrintErrorln("Unable to find channel '" + args[i] + "'")
 			continue
 		}
-		if result := <-a.Srv.Store.Channel().SetDeleteAt(channel.Id, 0, model.GetMillis()); result.Err != nil {
+		if err := a.Srv.Store.Channel().SetDeleteAt(channel.Id, 0, model.GetMillis()); err != nil {
 			CommandPrintErrorln("Unable to restore channel '" + args[i] + "'")
 		}
 	}
@@ -467,13 +492,9 @@ func modifyChannelCmdF(command *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	if len(args) != 1 {
-		return errors.New("Enter at one channel to modify.")
-	}
-
 	username, erru := command.Flags().GetString("username")
 	if erru != nil || username == "" {
-		return errors.New("Username is required")
+		return errors.New("Username is required.")
 	}
 
 	public, _ := command.Flags().GetBool("public")
@@ -499,7 +520,7 @@ func modifyChannelCmdF(command *cobra.Command, args []string) error {
 
 	user := getUserFromUserArg(a, username)
 	if _, err := a.UpdateChannelPrivacy(channel, user); err != nil {
-		return errors.New("Failed to update channel ('" + args[0] + "') privacy - " + err.Error())
+		return errors.Wrapf(err, "Failed to update channel ('%s') privacy", args[0])
 	}
 
 	return nil
@@ -512,10 +533,6 @@ func renameChannelCmdF(command *cobra.Command, args []string) error {
 		return err
 	}
 	defer a.Shutdown()
-
-	if len(args) < 2 {
-		return errors.New("Not enough arguments.")
-	}
 
 	channel := getChannelFromChannelArg(a, args[0])
 	if channel == nil {
@@ -530,8 +547,62 @@ func renameChannelCmdF(command *cobra.Command, args []string) error {
 
 	_, errch := a.RenameChannel(channel, newChannelName, newDisplayName)
 	if errch != nil {
-		return errors.New("Error in updating channel from " + channel.Name + " to " + newChannelName + err.Error())
+		return errors.Wrapf(errch, "Error in updating channel from %s to %s", channel.Name, newChannelName)
 	}
+
+	return nil
+}
+
+func searchChannelCmdF(command *cobra.Command, args []string) error {
+
+	a, err := InitDBCommandContextCobra(command)
+	if err != nil {
+		return errors.Wrap(err, "failed to InitDBCommandContextCobra")
+	}
+	defer a.Shutdown()
+
+	var channel *model.Channel
+
+	if teamArg, _ := command.Flags().GetString("team"); teamArg != "" {
+		team := getTeamFromTeamArg(a, teamArg)
+		if team == nil {
+			CommandPrettyPrintln(fmt.Sprintf("Team %s is not found", teamArg))
+			return nil
+		}
+
+		var aErr *model.AppError
+		channel, aErr = a.GetChannelByName(args[0], team.Id, true)
+		if aErr != nil || channel == nil {
+			CommandPrettyPrintln(fmt.Sprintf("Channel %s is not found in team %s", args[0], teamArg))
+			return nil
+		}
+	} else {
+		teams, aErr := a.GetAllTeams()
+		if aErr != nil {
+			return errors.Wrap(err, "failed to GetAllTeams")
+		}
+
+		for _, team := range teams {
+			channel, _ = a.GetChannelByName(args[0], team.Id, true)
+			if channel != nil && channel.Name == args[0] {
+				break
+			}
+		}
+
+		if channel == nil {
+			CommandPrettyPrintln(fmt.Sprintf("Channel %s is not found in any team", args[0]))
+			return nil
+		}
+	}
+
+	output := fmt.Sprintf(`Channel Name: %s, Display Name: %s, Channel ID: %s`, channel.Name, channel.DisplayName, channel.Id)
+	if channel.DeleteAt > 0 {
+		output += " (archived)"
+	}
+	if channel.Type == model.CHANNEL_PRIVATE {
+		output += " (private)"
+	}
+	CommandPrettyPrintln(output)
 
 	return nil
 }

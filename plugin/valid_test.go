@@ -1,3 +1,6 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
 package plugin_test
 
 import (
@@ -5,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/mattermost/mattermost-server/plugin"
+	"github.com/mattermost/mattermost-server/v5/plugin"
 )
 
 func TestIsValid(t *testing.T) {
@@ -18,8 +21,8 @@ func TestIsValid(t *testing.T) {
 		"abc": true,
 		"abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij":  true,
 		"abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij1": false,
-		"../path":                                 false,
-		"/etc/passwd":                             false,
+		"../path":     false,
+		"/etc/passwd": false,
 		"com.mattermost.plugin_with_features-0.9": true,
 		"PLUGINS-THAT-YELL-ARE-OK-2":              true,
 	}

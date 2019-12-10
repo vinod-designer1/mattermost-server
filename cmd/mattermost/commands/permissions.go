@@ -1,5 +1,5 @@
-// Copyright (c) 2018-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package commands
 
@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
 var PermissionsCmd = &cobra.Command{
@@ -124,9 +124,5 @@ func importPermissionsCmdF(command *cobra.Command, args []string) error {
 	}
 	defer file.Close()
 
-	if err := a.ImportPermissions(file); err != nil {
-		return err
-	}
-
-	return nil
+	return a.ImportPermissions(file)
 }

@@ -1,5 +1,5 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package model
 
@@ -38,6 +38,7 @@ type IncomingWebhookRequest struct {
 	Props       StringInterface    `json:"props"`
 	Attachments []*SlackAttachment `json:"attachments"`
 	Type        string             `json:"type"`
+	IconEmoji   string             `json:"icon_emoji"`
 }
 
 func (o *IncomingWebhook) ToJson() string {
@@ -93,7 +94,7 @@ func (o *IncomingWebhook) IsValid() *AppError {
 		return NewAppError("IncomingWebhook.IsValid", "model.incoming_hook.display_name.app_error", nil, "", http.StatusBadRequest)
 	}
 
-	if len(o.Description) > 128 {
+	if len(o.Description) > 500 {
 		return NewAppError("IncomingWebhook.IsValid", "model.incoming_hook.description.app_error", nil, "", http.StatusBadRequest)
 	}
 

@@ -1,5 +1,5 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package app
 
@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
 )
 
 const (
@@ -62,7 +62,7 @@ func (a *App) NewWebHub() *Hub {
 
 func (a *App) TotalWebsocketConnections() int {
 	count := int64(0)
-	for _, hub := range a.Hubs {
+	for _, hub := range a.Srv.Hubs {
 		count = count + atomic.LoadInt64(&hub.connectionCount)
 	}
 
@@ -72,15 +72,15 @@ func (a *App) TotalWebsocketConnections() int {
 func (a *App) HubStart() {
 	// Total number of hubs is twice the number of CPUs.
 	numberOfHubs := runtime.NumCPU() * 2
-	mlog.Info(fmt.Sprintf("Starting %v websocket hubs", numberOfHubs))
+	mlog.Info("Starting websocket hubs", mlog.Int("number_of_hubs", numberOfHubs))
 
-	a.Hubs = make([]*Hub, numberOfHubs)
-	a.HubsStopCheckingForDeadlock = make(chan bool, 1)
+	a.Srv.Hubs = make([]*Hub, numberOfHubs)
+	a.Srv.HubsStopCheckingForDeadlock = make(chan bool, 1)
 
-	for i := 0; i < len(a.Hubs); i++ {
-		a.Hubs[i] = a.NewWebHub()
-		a.Hubs[i].connectionIndex = i
-		a.Hubs[i].Start()
+	for i := 0; i < len(a.Srv.Hubs); i++ {
+		a.Srv.Hubs[i] = a.NewWebHub()
+		a.Srv.Hubs[i].connectionIndex = i
+		a.Srv.Hubs[i].Start()
 	}
 
 	go func() {
@@ -93,9 +93,14 @@ func (a *App) HubStart() {
 		for {
 			select {
 			case <-ticker.C:
-				for _, hub := range a.Hubs {
+				for _, hub := range a.Srv.Hubs {
 					if len(hub.broadcast) >= DEADLOCK_WARN {
-						mlog.Error(fmt.Sprintf("Hub processing might be deadlock on hub %v goroutine %v with %v events in the buffer", hub.connectionIndex, hub.goroutineId, len(hub.broadcast)))
+						mlog.Error(
+							"Hub processing might be deadlock with events in the buffer",
+							mlog.Int("hub", hub.connectionIndex),
+							mlog.Int("goroutine", hub.goroutineId),
+							mlog.Int("events", len(hub.broadcast)),
+						)
 						buf := make([]byte, 1<<16)
 						runtime.Stack(buf, true)
 						output := fmt.Sprintf("%s", buf)
@@ -103,13 +108,13 @@ func (a *App) HubStart() {
 
 						for _, part := range splits {
 							if strings.Contains(part, fmt.Sprintf("%v", hub.goroutineId)) {
-								mlog.Error(fmt.Sprintf("Trace for possible deadlock goroutine %v", part))
+								mlog.Error("Trace for possible deadlock goroutine", mlog.String("trace", part))
 							}
 						}
 					}
 				}
 
-			case <-a.HubsStopCheckingForDeadlock:
+			case <-a.Srv.HubsStopCheckingForDeadlock:
 				return
 			}
 		}
@@ -120,27 +125,27 @@ func (a *App) HubStop() {
 	mlog.Info("stopping websocket hub connections")
 
 	select {
-	case a.HubsStopCheckingForDeadlock <- true:
+	case a.Srv.HubsStopCheckingForDeadlock <- true:
 	default:
 		mlog.Warn("We appear to have already sent the stop checking for deadlocks command")
 	}
 
-	for _, hub := range a.Hubs {
+	for _, hub := range a.Srv.Hubs {
 		hub.Stop()
 	}
 
-	a.Hubs = []*Hub{}
+	a.Srv.Hubs = []*Hub{}
 }
 
 func (a *App) GetHubForUserId(userId string) *Hub {
-	if len(a.Hubs) == 0 {
+	if len(a.Srv.Hubs) == 0 {
 		return nil
 	}
 
 	hash := fnv.New32a()
 	hash.Write([]byte(userId))
-	index := hash.Sum32() % uint32(len(a.Hubs))
-	return a.Hubs[index]
+	index := hash.Sum32() % uint32(len(a.Srv.Hubs))
+	return a.Srv.Hubs[index]
 }
 
 func (a *App) HubRegister(webConn *WebConn) {
@@ -190,7 +195,7 @@ func (a *App) PublishSkipClusterSend(message *model.WebSocketEvent) {
 			hub.Broadcast(message)
 		}
 	} else {
-		for _, hub := range a.Hubs {
+		for _, hub := range a.Srv.Hubs {
 			hub.Broadcast(message)
 		}
 	}
@@ -246,6 +251,7 @@ func (a *App) InvalidateCacheForChannelMembers(channelId string) {
 func (a *App) InvalidateCacheForChannelMembersSkipClusterSend(channelId string) {
 	a.Srv.Store.User().InvalidateProfilesInChannelCache(channelId)
 	a.Srv.Store.Channel().InvalidateMemberCount(channelId)
+	a.Srv.Store.Channel().InvalidateGuestCount(channelId)
 }
 
 func (a *App) InvalidateCacheForChannelMembersNotifyProps(channelId string) {
@@ -288,6 +294,7 @@ func (a *App) InvalidateCacheForChannelPosts(channelId string) {
 
 func (a *App) InvalidateCacheForChannelPostsSkipClusterSend(channelId string) {
 	a.Srv.Store.Post().InvalidateLastPostTimeCache(channelId)
+	a.Srv.Store.Channel().InvalidatePinnedPostCount(channelId)
 }
 
 func (a *App) InvalidateCacheForUser(userId string) {
@@ -303,10 +310,32 @@ func (a *App) InvalidateCacheForUser(userId string) {
 	}
 }
 
+func (a *App) InvalidateCacheForUserTeams(userId string) {
+	a.InvalidateCacheForUserTeamsSkipClusterSend(userId)
+
+	if a.Cluster != nil {
+		msg := &model.ClusterMessage{
+			Event:    model.CLUSTER_EVENT_INVALIDATE_CACHE_FOR_USER_TEAMS,
+			SendType: model.CLUSTER_SEND_BEST_EFFORT,
+			Data:     userId,
+		}
+		a.Cluster.SendClusterMessage(msg)
+	}
+}
+
 func (a *App) InvalidateCacheForUserSkipClusterSend(userId string) {
 	a.Srv.Store.Channel().InvalidateAllChannelMembersForUser(userId)
 	a.Srv.Store.User().InvalidateProfilesInChannelCacheByUser(userId)
 	a.Srv.Store.User().InvalidatProfileCacheForUser(userId)
+
+	hub := a.GetHubForUserId(userId)
+	if hub != nil {
+		hub.InvalidateUser(userId)
+	}
+}
+
+func (a *App) InvalidateCacheForUserTeamsSkipClusterSend(userId string) {
+	a.Srv.Store.Team().InvalidateAllTeamIdsForUser(userId)
 
 	hub := a.GetHubForUserId(userId)
 	if hub != nil {
@@ -346,7 +375,10 @@ func (a *App) UpdateWebConnUserActivity(session model.Session, activityAt int64)
 }
 
 func (h *Hub) Register(webConn *WebConn) {
-	h.register <- webConn
+	select {
+	case h.register <- webConn:
+	case <-h.didStop:
+	}
 
 	if webConn.IsAuthenticated() {
 		webConn.SendHello()
@@ -362,16 +394,25 @@ func (h *Hub) Unregister(webConn *WebConn) {
 
 func (h *Hub) Broadcast(message *model.WebSocketEvent) {
 	if h != nil && h.broadcast != nil && message != nil {
-		h.broadcast <- message
+		select {
+		case h.broadcast <- message:
+		case <-h.didStop:
+		}
 	}
 }
 
 func (h *Hub) InvalidateUser(userId string) {
-	h.invalidateUser <- userId
+	select {
+	case h.invalidateUser <- userId:
+	case <-h.didStop:
+	}
 }
 
 func (h *Hub) UpdateActivity(userId, sessionToken string, activityAt int64) {
-	h.activity <- &WebConnActivityMessage{UserId: userId, SessionToken: sessionToken, ActivityAt: activityAt}
+	select {
+	case h.activity <- &WebConnActivityMessage{UserId: userId, SessionToken: sessionToken, ActivityAt: activityAt}:
+	case <-h.didStop:
+	}
 }
 
 func getGoroutineId() int {
@@ -397,7 +438,7 @@ func (h *Hub) Start() {
 
 	doStart = func() {
 		h.goroutineId = getGoroutineId()
-		mlog.Debug(fmt.Sprintf("Hub for index %v is starting with goroutine %v", h.connectionIndex, h.goroutineId))
+		mlog.Debug("Hub for index is starting with goroutine", mlog.Int("index", h.connectionIndex), mlog.Int("goroutine", h.goroutineId))
 
 		connections := newHubConnectionIndex()
 
@@ -416,7 +457,7 @@ func (h *Hub) Start() {
 
 				conns := connections.ForUser(webCon.UserId)
 				if len(conns) == 0 {
-					h.app.Go(func() {
+					h.app.Srv.Go(func() {
 						h.app.SetStatusOffline(webCon.UserId, false)
 					})
 				} else {
@@ -427,7 +468,7 @@ func (h *Hub) Start() {
 						}
 					}
 					if h.app.IsUserAway(latestActivity) {
-						h.app.Go(func() {
+						h.app.Srv.Go(func() {
 							h.app.SetStatusLastActivityAt(webCon.UserId, latestActivity)
 						})
 					}
@@ -453,7 +494,7 @@ func (h *Hub) Start() {
 						select {
 						case webCon.Send <- msg:
 						default:
-							mlog.Error(fmt.Sprintf("webhub.broadcast: cannot send, closing websocket for userId=%v", webCon.UserId))
+							mlog.Error("webhub.broadcast: cannot send, closing websocket for user", mlog.String("user_id", webCon.UserId))
 							close(webCon.Send)
 							connections.Remove(webCon)
 						}
@@ -487,7 +528,7 @@ func (h *Hub) Start() {
 	doRecover = func() {
 		if !h.ExplicitStop {
 			if r := recover(); r != nil {
-				mlog.Error(fmt.Sprintf("Recovering from Hub panic. Panic was: %v", r))
+				mlog.Error("Recovering from Hub panic.", mlog.Any("panic", r))
 			} else {
 				mlog.Error("Webhub stopped unexpectedly. Recovering.")
 			}
