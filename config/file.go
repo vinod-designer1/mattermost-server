@@ -19,6 +19,7 @@ import (
 )
 
 var (
+	// ErrReadOnlyConfiguration is returned when an attempt to modify a read-only configuration is made.
 	ErrReadOnlyConfiguration = errors.New("configuration is read-only")
 )
 
@@ -180,6 +181,12 @@ func (fs *FileStore) GetFile(name string) ([]byte, error) {
 	return data, nil
 }
 
+// GetFilePath returns the resolved path of a configuration file.
+// The file may not necessarily exist.
+func (fs *FileStore) GetFilePath(name string) string {
+	return fs.resolveFilePath(name)
+}
+
 // SetFile sets or replaces the contents of a configuration file.
 func (fs *FileStore) SetFile(name string, data []byte) error {
 	resolvedPath := fs.resolveFilePath(name)
@@ -227,7 +234,7 @@ func (fs *FileStore) RemoveFile(name string) error {
 		return errors.Wrap(err, "failed to remove file")
 	}
 
-	return err
+	return nil
 }
 
 // startWatcher starts a watcher to monitor for external config file changes.

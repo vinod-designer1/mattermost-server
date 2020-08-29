@@ -40,8 +40,9 @@ func (s LocalCacheTeamStore) GetUserTeamIds(userID string, allowFromCache bool) 
 		return s.TeamStore.GetUserTeamIds(userID, allowFromCache)
 	}
 
-	if userTeamIds := s.rootStore.doStandardReadCache(s.rootStore.teamAllTeamIdsForUserCache, userID); userTeamIds != nil {
-		return userTeamIds.([]string), nil
+	var userTeamIds []string
+	if err := s.rootStore.doStandardReadCache(s.rootStore.teamAllTeamIdsForUserCache, userID, &userTeamIds); err == nil {
+		return userTeamIds, nil
 	}
 
 	userTeamIds, err := s.TeamStore.GetUserTeamIds(userID, allowFromCache)
@@ -70,6 +71,7 @@ func (s LocalCacheTeamStore) Update(team *model.Team) (*model.Team, *model.AppEr
 	if err != nil {
 		return nil, err
 	}
+	defer s.rootStore.doClearCacheCluster(s.rootStore.rolePermissionsCache)
 
 	if oldTeam != nil && oldTeam.DeleteAt == 0 {
 		s.rootStore.doClearCacheCluster(s.rootStore.teamAllTeamIdsForUserCache)

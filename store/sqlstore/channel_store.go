@@ -10,26 +10,27 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mattermost/gorp"
-	"github.com/pkg/errors"
-
-	sq "github.com/Masterminds/squirrel"
 	"github.com/mattermost/mattermost-server/v5/einterfaces"
 	"github.com/mattermost/mattermost-server/v5/mlog"
 	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/services/cache"
 	"github.com/mattermost/mattermost-server/v5/store"
-	"github.com/mattermost/mattermost-server/v5/utils"
+
+	sq "github.com/Masterminds/squirrel"
+	"github.com/pkg/errors"
 )
 
 const (
-	ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_SIZE = model.SESSION_CACHE_SIZE
-	ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_SEC  = 900 // 15 mins
+	ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_SIZE     = model.SESSION_CACHE_SIZE
+	ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_DURATION = 15 * time.Minute // 15 mins
 
-	ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_SIZE = model.SESSION_CACHE_SIZE
-	ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_SEC  = 1800 // 30 mins
+	ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_SIZE     = model.SESSION_CACHE_SIZE
+	ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_DURATION = 30 * time.Minute // 30 mins
 
-	CHANNEL_CACHE_SEC = 900 // 15 mins
+	CHANNEL_CACHE_DURATION = 15 * time.Minute // 15 mins
 )
 
 type SqlChannelStore struct {
@@ -87,94 +88,154 @@ type channelMemberWithSchemeRoles struct {
 	ChannelSchemeDefaultAdminRole sql.NullString
 }
 
+func channelMemberSliceColumns() []string {
+	return []string{"ChannelId", "UserId", "Roles", "LastViewedAt", "MsgCount", "MentionCount", "NotifyProps", "LastUpdateAt", "SchemeUser", "SchemeAdmin", "SchemeGuest"}
+}
+
+func channelMemberToSlice(member *model.ChannelMember) []interface{} {
+	resultSlice := []interface{}{}
+	resultSlice = append(resultSlice, member.ChannelId)
+	resultSlice = append(resultSlice, member.UserId)
+	resultSlice = append(resultSlice, member.ExplicitRoles)
+	resultSlice = append(resultSlice, member.LastViewedAt)
+	resultSlice = append(resultSlice, member.MsgCount)
+	resultSlice = append(resultSlice, member.MentionCount)
+	resultSlice = append(resultSlice, model.MapToJson(member.NotifyProps))
+	resultSlice = append(resultSlice, member.LastUpdateAt)
+	resultSlice = append(resultSlice, member.SchemeUser)
+	resultSlice = append(resultSlice, member.SchemeAdmin)
+	resultSlice = append(resultSlice, member.SchemeGuest)
+	return resultSlice
+}
+
 type channelMemberWithSchemeRolesList []channelMemberWithSchemeRoles
 
-func (db channelMemberWithSchemeRoles) ToModel() *model.ChannelMember {
-	var roles []string
-	var explicitRoles []string
+func getChannelRoles(schemeGuest, schemeUser, schemeAdmin bool, defaultTeamGuestRole, defaultTeamUserRole, defaultTeamAdminRole, defaultChannelGuestRole, defaultChannelUserRole, defaultChannelAdminRole string, roles []string) rolesInfo {
+	result := rolesInfo{
+		roles:         []string{},
+		explicitRoles: []string{},
+		schemeGuest:   schemeGuest,
+		schemeUser:    schemeUser,
+		schemeAdmin:   schemeAdmin,
+	}
 
-	// Identify any system-wide scheme derived roles that are in "Roles" field due to not yet being migrated,
-	// and exclude them from ExplicitRoles field.
-	schemeGuest := db.SchemeGuest.Valid && db.SchemeGuest.Bool
-	schemeUser := db.SchemeUser.Valid && db.SchemeUser.Bool
-	schemeAdmin := db.SchemeAdmin.Valid && db.SchemeAdmin.Bool
-	for _, role := range strings.Fields(db.Roles) {
-		isImplicit := false
-		if role == model.CHANNEL_GUEST_ROLE_ID {
-			// We have an implicit role via the system scheme. Override the "schemeGuest" field to true.
-			schemeGuest = true
-			isImplicit = true
-		} else if role == model.CHANNEL_USER_ROLE_ID {
-			// We have an implicit role via the system scheme. Override the "schemeUser" field to true.
-			schemeUser = true
-			isImplicit = true
-		} else if role == model.CHANNEL_ADMIN_ROLE_ID {
-			// We have an implicit role via the system scheme.
-			schemeAdmin = true
-			isImplicit = true
+	// Identify any scheme derived roles that are in "Roles" field due to not yet being migrated, and exclude
+	// them from ExplicitRoles field.
+	for _, role := range roles {
+		switch role {
+		case model.CHANNEL_GUEST_ROLE_ID:
+			result.schemeGuest = true
+		case model.CHANNEL_USER_ROLE_ID:
+			result.schemeUser = true
+		case model.CHANNEL_ADMIN_ROLE_ID:
+			result.schemeAdmin = true
+		default:
+			result.explicitRoles = append(result.explicitRoles, role)
+			result.roles = append(result.roles, role)
 		}
-
-		if !isImplicit {
-			explicitRoles = append(explicitRoles, role)
-		}
-		roles = append(roles, role)
 	}
 
 	// Add any scheme derived roles that are not in the Roles field due to being Implicit from the Scheme, and add
 	// them to the Roles field for backwards compatibility reasons.
 	var schemeImpliedRoles []string
-	if db.SchemeGuest.Valid && db.SchemeGuest.Bool {
-		if db.ChannelSchemeDefaultGuestRole.Valid && db.ChannelSchemeDefaultGuestRole.String != "" {
-			schemeImpliedRoles = append(schemeImpliedRoles, db.ChannelSchemeDefaultGuestRole.String)
-		} else if db.TeamSchemeDefaultGuestRole.Valid && db.TeamSchemeDefaultGuestRole.String != "" {
-			schemeImpliedRoles = append(schemeImpliedRoles, db.TeamSchemeDefaultGuestRole.String)
+	if result.schemeGuest {
+		if defaultChannelGuestRole != "" {
+			schemeImpliedRoles = append(schemeImpliedRoles, defaultChannelGuestRole)
+		} else if defaultTeamGuestRole != "" {
+			schemeImpliedRoles = append(schemeImpliedRoles, defaultTeamGuestRole)
 		} else {
 			schemeImpliedRoles = append(schemeImpliedRoles, model.CHANNEL_GUEST_ROLE_ID)
 		}
 	}
-	if db.SchemeUser.Valid && db.SchemeUser.Bool {
-		if db.ChannelSchemeDefaultUserRole.Valid && db.ChannelSchemeDefaultUserRole.String != "" {
-			schemeImpliedRoles = append(schemeImpliedRoles, db.ChannelSchemeDefaultUserRole.String)
-		} else if db.TeamSchemeDefaultUserRole.Valid && db.TeamSchemeDefaultUserRole.String != "" {
-			schemeImpliedRoles = append(schemeImpliedRoles, db.TeamSchemeDefaultUserRole.String)
+	if result.schemeUser {
+		if defaultChannelUserRole != "" {
+			schemeImpliedRoles = append(schemeImpliedRoles, defaultChannelUserRole)
+		} else if defaultTeamUserRole != "" {
+			schemeImpliedRoles = append(schemeImpliedRoles, defaultTeamUserRole)
 		} else {
 			schemeImpliedRoles = append(schemeImpliedRoles, model.CHANNEL_USER_ROLE_ID)
 		}
 	}
-	if db.SchemeAdmin.Valid && db.SchemeAdmin.Bool {
-		if db.ChannelSchemeDefaultAdminRole.Valid && db.ChannelSchemeDefaultAdminRole.String != "" {
-			schemeImpliedRoles = append(schemeImpliedRoles, db.ChannelSchemeDefaultAdminRole.String)
-		} else if db.TeamSchemeDefaultAdminRole.Valid && db.TeamSchemeDefaultAdminRole.String != "" {
-			schemeImpliedRoles = append(schemeImpliedRoles, db.TeamSchemeDefaultAdminRole.String)
+	if result.schemeAdmin {
+		if defaultChannelAdminRole != "" {
+			schemeImpliedRoles = append(schemeImpliedRoles, defaultChannelAdminRole)
+		} else if defaultTeamAdminRole != "" {
+			schemeImpliedRoles = append(schemeImpliedRoles, defaultTeamAdminRole)
 		} else {
 			schemeImpliedRoles = append(schemeImpliedRoles, model.CHANNEL_ADMIN_ROLE_ID)
 		}
 	}
 	for _, impliedRole := range schemeImpliedRoles {
 		alreadyThere := false
-		for _, role := range roles {
+		for _, role := range result.roles {
 			if role == impliedRole {
 				alreadyThere = true
+				break
 			}
 		}
 		if !alreadyThere {
-			roles = append(roles, impliedRole)
+			result.roles = append(result.roles, impliedRole)
 		}
 	}
+	return result
+}
 
+func (db channelMemberWithSchemeRoles) ToModel() *model.ChannelMember {
+	// Identify any system-wide scheme derived roles that are in "Roles" field due to not yet being migrated,
+	// and exclude them from ExplicitRoles field.
+	schemeGuest := db.SchemeGuest.Valid && db.SchemeGuest.Bool
+	schemeUser := db.SchemeUser.Valid && db.SchemeUser.Bool
+	schemeAdmin := db.SchemeAdmin.Valid && db.SchemeAdmin.Bool
+
+	defaultTeamGuestRole := ""
+	if db.TeamSchemeDefaultGuestRole.Valid {
+		defaultTeamGuestRole = db.TeamSchemeDefaultGuestRole.String
+	}
+
+	defaultTeamUserRole := ""
+	if db.TeamSchemeDefaultUserRole.Valid {
+		defaultTeamUserRole = db.TeamSchemeDefaultUserRole.String
+	}
+
+	defaultTeamAdminRole := ""
+	if db.TeamSchemeDefaultAdminRole.Valid {
+		defaultTeamAdminRole = db.TeamSchemeDefaultAdminRole.String
+	}
+
+	defaultChannelGuestRole := ""
+	if db.ChannelSchemeDefaultGuestRole.Valid {
+		defaultChannelGuestRole = db.ChannelSchemeDefaultGuestRole.String
+	}
+
+	defaultChannelUserRole := ""
+	if db.ChannelSchemeDefaultUserRole.Valid {
+		defaultChannelUserRole = db.ChannelSchemeDefaultUserRole.String
+	}
+
+	defaultChannelAdminRole := ""
+	if db.ChannelSchemeDefaultAdminRole.Valid {
+		defaultChannelAdminRole = db.ChannelSchemeDefaultAdminRole.String
+	}
+
+	rolesResult := getChannelRoles(
+		schemeGuest, schemeUser, schemeAdmin,
+		defaultTeamGuestRole, defaultTeamUserRole, defaultTeamAdminRole,
+		defaultChannelGuestRole, defaultChannelUserRole, defaultChannelAdminRole,
+		strings.Fields(db.Roles),
+	)
 	return &model.ChannelMember{
 		ChannelId:     db.ChannelId,
 		UserId:        db.UserId,
-		Roles:         strings.Join(roles, " "),
+		Roles:         strings.Join(rolesResult.roles, " "),
 		LastViewedAt:  db.LastViewedAt,
 		MsgCount:      db.MsgCount,
 		MentionCount:  db.MentionCount,
 		NotifyProps:   db.NotifyProps,
 		LastUpdateAt:  db.LastUpdateAt,
-		SchemeAdmin:   schemeAdmin,
-		SchemeUser:    schemeUser,
-		SchemeGuest:   schemeGuest,
-		ExplicitRoles: strings.Join(explicitRoles, " "),
+		SchemeAdmin:   rolesResult.schemeAdmin,
+		SchemeUser:    rolesResult.schemeUser,
+		SchemeGuest:   rolesResult.schemeGuest,
+		ExplicitRoles: strings.Join(rolesResult.explicitRoles, " "),
 	}
 }
 
@@ -274,9 +335,15 @@ type publicChannel struct {
 	Purpose     string `json:"purpose"`
 }
 
-var allChannelMembersForUserCache = utils.NewLru(ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_SIZE)
-var allChannelMembersNotifyPropsForChannelCache = utils.NewLru(ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_SIZE)
-var channelByNameCache = utils.NewLru(model.CHANNEL_CACHE_SIZE)
+var allChannelMembersForUserCache = cache.NewLRU(&cache.LRUOptions{
+	Size: ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_SIZE,
+})
+var allChannelMembersNotifyPropsForChannelCache = cache.NewLRU(&cache.LRUOptions{
+	Size: ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_SIZE,
+})
+var channelByNameCache = cache.NewLRU(&cache.LRUOptions{
+	Size: model.CHANNEL_CACHE_SIZE,
+})
 
 func (s SqlChannelStore) ClearCaches() {
 	allChannelMembersForUserCache.Purge()
@@ -290,7 +357,7 @@ func (s SqlChannelStore) ClearCaches() {
 	}
 }
 
-func NewSqlChannelStore(sqlStore SqlStore, metrics einterfaces.MetricsInterface) store.ChannelStore {
+func newSqlChannelStore(sqlStore SqlStore, metrics einterfaces.MetricsInterface) store.ChannelStore {
 	s := &SqlChannelStore{
 		SqlStore: sqlStore,
 		metrics:  metrics,
@@ -323,12 +390,25 @@ func NewSqlChannelStore(sqlStore SqlStore, metrics einterfaces.MetricsInterface)
 		tablePublicChannels.SetUniqueTogether("Name", "TeamId")
 		tablePublicChannels.ColMap("Header").SetMaxSize(1024)
 		tablePublicChannels.ColMap("Purpose").SetMaxSize(250)
+
+		tableSidebarCategories := db.AddTableWithName(model.SidebarCategory{}, "SidebarCategories").SetKeys(false, "Id")
+		tableSidebarCategories.ColMap("Id").SetMaxSize(26)
+		tableSidebarCategories.ColMap("UserId").SetMaxSize(26)
+		tableSidebarCategories.ColMap("TeamId").SetMaxSize(26)
+		tableSidebarCategories.ColMap("Sorting").SetMaxSize(64)
+		tableSidebarCategories.ColMap("Type").SetMaxSize(64)
+		tableSidebarCategories.ColMap("DisplayName").SetMaxSize(64)
+
+		tableSidebarChannels := db.AddTableWithName(model.SidebarChannel{}, "SidebarChannels").SetKeys(false, "ChannelId", "UserId", "CategoryId")
+		tableSidebarChannels.ColMap("ChannelId").SetMaxSize(26)
+		tableSidebarChannels.ColMap("UserId").SetMaxSize(26)
+		tableSidebarChannels.ColMap("CategoryId").SetMaxSize(26)
 	}
 
 	return s
 }
 
-func (s SqlChannelStore) CreateIndexesIfNotExists() {
+func (s SqlChannelStore) createIndexesIfNotExists() {
 	s.CreateIndexIfNotExists("idx_channels_team_id", "Channels", "TeamId")
 	s.CreateIndexIfNotExists("idx_channels_name", "Channels", "Name")
 	s.CreateIndexIfNotExists("idx_channels_update_at", "Channels", "UpdateAt")
@@ -353,6 +433,7 @@ func (s SqlChannelStore) CreateIndexesIfNotExists() {
 		s.CreateIndexIfNotExists("idx_publicchannels_displayname_lower", "PublicChannels", "lower(DisplayName)")
 	}
 	s.CreateFullTextIndexIfNotExists("idx_publicchannels_search_txt", "PublicChannels", "Name, DisplayName, Purpose")
+	s.CreateIndexIfNotExists("idx_channels_scheme_id", "Channels", "SchemeId")
 }
 
 // MigratePublicChannels initializes the PublicChannels table with data created before this version
@@ -441,41 +522,41 @@ func (s SqlChannelStore) upsertPublicChannelT(transaction *gorp.Transaction, cha
 }
 
 // Save writes the (non-direct) channel channel to the database.
-func (s SqlChannelStore) Save(channel *model.Channel, maxChannelsPerTeam int64) (*model.Channel, *model.AppError) {
-
+func (s SqlChannelStore) Save(channel *model.Channel, maxChannelsPerTeam int64) (*model.Channel, error) {
 	if channel.DeleteAt != 0 {
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save.archived_channel.app_error", nil, "", http.StatusBadRequest)
+		return nil, store.NewErrInvalidInput("Channel", "DeleteAt", channel.DeleteAt)
 	}
 
 	if channel.Type == model.CHANNEL_DIRECT {
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save.direct_channel.app_error", nil, "", http.StatusBadRequest)
+		return nil, store.NewErrInvalidInput("Channel", "Type", channel.Type)
 	}
 
+	var newChannel *model.Channel
 	transaction, err := s.GetMaster().Begin()
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "begin_transaction")
 	}
 	defer finalizeTransaction(transaction)
 
-	newChannel, appErr := s.saveChannelT(transaction, channel, maxChannelsPerTeam)
-	if appErr != nil {
-		return newChannel, appErr
+	newChannel, err = s.saveChannelT(transaction, channel, maxChannelsPerTeam)
+	if err != nil {
+		return newChannel, err
 	}
 
 	// Additionally propagate the write to the PublicChannels table.
-	if err := s.upsertPublicChannelT(transaction, newChannel); err != nil {
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save.upsert_public_channel.app_error", nil, err.Error(), http.StatusInternalServerError)
-
+	if err = s.upsertPublicChannelT(transaction, newChannel); err != nil {
+		return nil, errors.Wrap(err, "upsert_public_channel")
 	}
 
-	if err := transaction.Commit(); err != nil {
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+	if err = transaction.Commit(); err != nil {
+		return nil, errors.Wrap(err, "commit_transaction")
 	}
-
-	return newChannel, nil
+	// There are cases when in case of conflict, the original channel value is returned.
+	// So we return both and let the caller do the checks.
+	return newChannel, err
 }
 
-func (s SqlChannelStore) CreateDirectChannel(user *model.User, otherUser *model.User) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) CreateDirectChannel(user *model.User, otherUser *model.User) (*model.Channel, error) {
 	channel := new(model.Channel)
 
 	channel.DisplayName = ""
@@ -500,71 +581,63 @@ func (s SqlChannelStore) CreateDirectChannel(user *model.User, otherUser *model.
 	return s.SaveDirectChannel(channel, cm1, cm2)
 }
 
-func (s SqlChannelStore) SaveDirectChannel(directchannel *model.Channel, member1 *model.ChannelMember, member2 *model.ChannelMember) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) SaveDirectChannel(directchannel *model.Channel, member1 *model.ChannelMember, member2 *model.ChannelMember) (*model.Channel, error) {
 	if directchannel.DeleteAt != 0 {
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save.archived_channel.app_error", nil, "", http.StatusBadRequest)
+		return nil, store.NewErrInvalidInput("Channel", "DeleteAt", directchannel.DeleteAt)
 	}
 
 	if directchannel.Type != model.CHANNEL_DIRECT {
-		return nil, model.NewAppError("SqlChannelStore.SaveDirectChannel", "store.sql_channel.save_direct_channel.not_direct.app_error", nil, "", http.StatusBadRequest)
+		return nil, store.NewErrInvalidInput("Channel", "Type", directchannel.Type)
 	}
 
 	transaction, err := s.GetMaster().Begin()
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.SaveDirectChannel", "store.sql_channel.save_direct_channel.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "begin_transaction")
 	}
 	defer finalizeTransaction(transaction)
 
 	directchannel.TeamId = ""
-	newChannel, appErr := s.saveChannelT(transaction, directchannel, 0)
-	if appErr != nil {
-		return newChannel, appErr
+	newChannel, err := s.saveChannelT(transaction, directchannel, 0)
+	if err != nil {
+		return newChannel, err
 	}
 
 	// Members need new channel ID
 	member1.ChannelId = newChannel.Id
 	member2.ChannelId = newChannel.Id
 
-	_, member1SaveErr := s.saveMemberT(transaction, member1, newChannel)
-	member2SaveErr := member1SaveErr
 	if member1.UserId != member2.UserId {
-		_, member2SaveErr = s.saveMemberT(transaction, member2, newChannel)
+		_, err = s.saveMultipleMembersT(transaction, []*model.ChannelMember{member1, member2})
+	} else {
+		_, err = s.saveMemberT(transaction, member2)
 	}
-
-	if member1SaveErr != nil || member2SaveErr != nil {
-		details := ""
-		if member1SaveErr != nil {
-			details += "Member1Err: " + member1SaveErr.Message
-		}
-		if member2SaveErr != nil {
-			details += "Member2Err: " + member2SaveErr.Message
-		}
-		return nil, model.NewAppError("SqlChannelStore.SaveDirectChannel", "store.sql_channel.save_direct_channel.add_members.app_error", nil, details, http.StatusInternalServerError)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := transaction.Commit(); err != nil {
-		return nil, model.NewAppError("SqlChannelStore.SaveDirectChannel", "store.sql_channel.save_direct_channel.commit.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "commit_transaction")
 	}
 
 	return newChannel, nil
 
 }
 
-func (s SqlChannelStore) saveChannelT(transaction *gorp.Transaction, channel *model.Channel, maxChannelsPerTeam int64) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) saveChannelT(transaction *gorp.Transaction, channel *model.Channel, maxChannelsPerTeam int64) (*model.Channel, error) {
 	if len(channel.Id) > 0 {
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save_channel.existing.app_error", nil, "id="+channel.Id, http.StatusBadRequest)
+		return nil, store.NewErrInvalidInput("Channel", "Id", channel.Id)
 	}
 
 	channel.PreSave()
-	if err := channel.IsValid(); err != nil {
-		return nil, err
+	if err := channel.IsValid(); err != nil { // TODO: this needs to return plain error in v6.
+		return nil, err // we just pass through the error as-is for now.
 	}
 
 	if channel.Type != model.CHANNEL_DIRECT && channel.Type != model.CHANNEL_GROUP && maxChannelsPerTeam >= 0 {
 		if count, err := transaction.SelectInt("SELECT COUNT(0) FROM Channels WHERE TeamId = :TeamId AND DeleteAt = 0 AND (Type = 'O' OR Type = 'P')", map[string]interface{}{"TeamId": channel.TeamId}); err != nil {
-			return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save_channel.current_count.app_error", nil, "teamId="+channel.TeamId+", "+err.Error(), http.StatusInternalServerError)
+			return nil, errors.Wrapf(err, "save_channel_count: teamId=%s", channel.TeamId)
 		} else if count >= maxChannelsPerTeam {
-			return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save_channel.limit.app_error", nil, "teamId="+channel.TeamId, http.StatusBadRequest)
+			return nil, store.NewErrLimitExceeded("channels_per_team", int(count), "teamId="+channel.TeamId)
 		}
 	}
 
@@ -572,18 +645,18 @@ func (s SqlChannelStore) saveChannelT(transaction *gorp.Transaction, channel *mo
 		if IsUniqueConstraintError(err, []string{"Name", "channels_name_teamid_key"}) {
 			dupChannel := model.Channel{}
 			s.GetMaster().SelectOne(&dupChannel, "SELECT * FROM Channels WHERE TeamId = :TeamId AND Name = :Name", map[string]interface{}{"TeamId": channel.TeamId, "Name": channel.Name})
-			return &dupChannel, model.NewAppError("SqlChannelStore.Save", store.CHANNEL_EXISTS_ERROR, nil, "id="+channel.Id+", "+err.Error(), http.StatusBadRequest)
+			return &dupChannel, store.NewErrConflict("Channel", err, "id="+channel.Id)
 		}
-		return nil, model.NewAppError("SqlChannelStore.Save", "store.sql_channel.save_channel.save.app_error", nil, "id="+channel.Id+", "+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "save_channel: id=%s", channel.Id)
 	}
 	return channel, nil
 }
 
 // Update writes the updated channel to the database.
-func (s SqlChannelStore) Update(channel *model.Channel) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) Update(channel *model.Channel) (*model.Channel, error) {
 	transaction, err := s.GetMaster().Begin()
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "begin_transaction")
 	}
 	defer finalizeTransaction(transaction)
 
@@ -594,20 +667,20 @@ func (s SqlChannelStore) Update(channel *model.Channel) (*model.Channel, *model.
 
 	// Additionally propagate the write to the PublicChannels table.
 	if err := s.upsertPublicChannelT(transaction, updatedChannel); err != nil {
-		return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.upsert_public_channel.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "upsertPublicChannelT: failed to upsert channel")
 	}
 
 	if err := transaction.Commit(); err != nil {
-		return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "commit_transaction")
 	}
 	return updatedChannel, nil
 }
 
-func (s SqlChannelStore) updateChannelT(transaction *gorp.Transaction, channel *model.Channel) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) updateChannelT(transaction *gorp.Transaction, channel *model.Channel) (*model.Channel, error) {
 	channel.PreUpdate()
 
 	if channel.DeleteAt != 0 {
-		return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.archived_channel.app_error", nil, "", http.StatusBadRequest)
+		return nil, store.NewErrInvalidInput("Channel", "DeleteAt", channel.DeleteAt)
 	}
 
 	if err := channel.IsValid(); err != nil {
@@ -620,15 +693,15 @@ func (s SqlChannelStore) updateChannelT(transaction *gorp.Transaction, channel *
 			dupChannel := model.Channel{}
 			s.GetReplica().SelectOne(&dupChannel, "SELECT * FROM Channels WHERE TeamId = :TeamId AND Name= :Name AND DeleteAt > 0", map[string]interface{}{"TeamId": channel.TeamId, "Name": channel.Name})
 			if dupChannel.DeleteAt > 0 {
-				return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.previously.app_error", nil, "id="+channel.Id+", "+err.Error(), http.StatusBadRequest)
+				return nil, store.NewErrInvalidInput("Channel", "Id", channel.Id)
 			}
-			return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.exists.app_error", nil, "id="+channel.Id+", "+err.Error(), http.StatusBadRequest)
+			return nil, store.NewErrInvalidInput("Channel", "Id", channel.Id)
 		}
-		return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.updating.app_error", nil, "id="+channel.Id+", "+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "failed to update channel with id=%s", channel.Id)
 	}
 
-	if count != 1 {
-		return nil, model.NewAppError("SqlChannelStore.Update", "store.sql_channel.update.app_error", nil, "id="+channel.Id, http.StatusInternalServerError)
+	if count > 1 {
+		return nil, fmt.Errorf("the expected number of channels to be updated is <=1 but was %d", count)
 	}
 
 	return channel, nil
@@ -667,7 +740,7 @@ func (s SqlChannelStore) InvalidateChannelByName(teamId, name string) {
 	}
 }
 
-func (s SqlChannelStore) Get(id string, allowFromCache bool) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) Get(id string, allowFromCache bool) (*model.Channel, error) {
 	return s.get(id, false, allowFromCache)
 }
 
@@ -675,7 +748,7 @@ func (s SqlChannelStore) GetPinnedPosts(channelId string) (*model.PostList, *mod
 	pl := model.NewPostList()
 
 	var posts []*model.Post
-	if _, err := s.GetReplica().Select(&posts, "SELECT * FROM Posts WHERE IsPinned = true AND ChannelId = :ChannelId AND DeleteAt = 0 ORDER BY CreateAt ASC", map[string]interface{}{"ChannelId": channelId}); err != nil {
+	if _, err := s.GetReplica().Select(&posts, "SELECT *, (SELECT count(Posts.Id) FROM Posts WHERE Posts.RootId = (CASE WHEN p.RootId = '' THEN p.Id ELSE p.RootId END) AND Posts.DeleteAt = 0) as ReplyCount  FROM Posts p WHERE IsPinned = true AND ChannelId = :ChannelId AND DeleteAt = 0 ORDER BY CreateAt ASC", map[string]interface{}{"ChannelId": channelId}); err != nil {
 		return nil, model.NewAppError("SqlPostStore.GetPinnedPosts", "store.sql_channel.pinned_posts.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 	for _, post := range posts {
@@ -685,11 +758,11 @@ func (s SqlChannelStore) GetPinnedPosts(channelId string) (*model.PostList, *mod
 	return pl, nil
 }
 
-func (s SqlChannelStore) GetFromMaster(id string) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) GetFromMaster(id string) (*model.Channel, error) {
 	return s.get(id, true, false)
 }
 
-func (s SqlChannelStore) get(id string, master bool, allowFromCache bool) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) get(id string, master bool, allowFromCache bool) (*model.Channel, error) {
 	var db *gorp.DbMap
 
 	if master {
@@ -700,11 +773,11 @@ func (s SqlChannelStore) get(id string, master bool, allowFromCache bool) (*mode
 
 	obj, err := db.Get(model.Channel{}, id)
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.Get", "store.sql_channel.get.find.app_error", nil, "id="+id+", "+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "failed to find channel with id = %s", id)
 	}
 
 	if obj == nil {
-		return nil, model.NewAppError("SqlChannelStore.Get", "store.sql_channel.get.existing.app_error", nil, "id="+id, http.StatusNotFound)
+		return nil, store.NewErrNotFound("Channel", id)
 	}
 
 	ch := obj.(*model.Channel)
@@ -712,28 +785,28 @@ func (s SqlChannelStore) get(id string, master bool, allowFromCache bool) (*mode
 }
 
 // Delete records the given deleted timestamp to the channel in question.
-func (s SqlChannelStore) Delete(channelId string, time int64) *model.AppError {
+func (s SqlChannelStore) Delete(channelId string, time int64) error {
 	return s.SetDeleteAt(channelId, time, time)
 }
 
 // Restore reverts a previous deleted timestamp from the channel in question.
-func (s SqlChannelStore) Restore(channelId string, time int64) *model.AppError {
+func (s SqlChannelStore) Restore(channelId string, time int64) error {
 	return s.SetDeleteAt(channelId, 0, time)
 }
 
 // SetDeleteAt records the given deleted and updated timestamp to the channel in question.
-func (s SqlChannelStore) SetDeleteAt(channelId string, deleteAt, updateAt int64) *model.AppError {
+func (s SqlChannelStore) SetDeleteAt(channelId string, deleteAt, updateAt int64) error {
 	defer s.InvalidateChannel(channelId)
 
 	transaction, err := s.GetMaster().Begin()
 	if err != nil {
-		return model.NewAppError("SqlChannelStore.SetDeleteAt", "store.sql_channel.set_delete_at.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return errors.Wrap(err, "SetDeleteAt: begin_transaction")
 	}
 	defer finalizeTransaction(transaction)
 
-	appErr := s.setDeleteAtT(transaction, channelId, deleteAt, updateAt)
-	if appErr != nil {
-		return appErr
+	err = s.setDeleteAtT(transaction, channelId, deleteAt, updateAt)
+	if err != nil {
+		return errors.Wrap(err, "setDeleteAtT")
 	}
 
 	// Additionally propagate the write to the PublicChannels table.
@@ -748,35 +821,35 @@ func (s SqlChannelStore) SetDeleteAt(channelId string, deleteAt, updateAt int64)
 		"DeleteAt":  deleteAt,
 		"ChannelId": channelId,
 	}); err != nil {
-		return model.NewAppError("SqlChannelStore.SetDeleteAt", "store.sql_channel.set_delete_at.update_public_channel.app_error", nil, "channel_id="+channelId+", "+err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "failed to delete public channels with id=%s", channelId)
 	}
 
 	if err := transaction.Commit(); err != nil {
-		return model.NewAppError("SqlChannelStore.SetDeleteAt", "store.sql_channel.set_delete_at.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "SetDeleteAt: commit_transaction")
 	}
 
 	return nil
 }
 
-func (s SqlChannelStore) setDeleteAtT(transaction *gorp.Transaction, channelId string, deleteAt, updateAt int64) *model.AppError {
+func (s SqlChannelStore) setDeleteAtT(transaction *gorp.Transaction, channelId string, deleteAt, updateAt int64) error {
 	_, err := transaction.Exec("Update Channels SET DeleteAt = :DeleteAt, UpdateAt = :UpdateAt WHERE Id = :ChannelId", map[string]interface{}{"DeleteAt": deleteAt, "UpdateAt": updateAt, "ChannelId": channelId})
 	if err != nil {
-		return model.NewAppError("SqlChannelStore.Delete", "store.sql_channel.delete.channel.app_error", nil, "id="+channelId+", err="+err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "failed to delete channel with id=%s", channelId)
 	}
 
 	return nil
 }
 
 // PermanentDeleteByTeam removes all channels for the given team from the database.
-func (s SqlChannelStore) PermanentDeleteByTeam(teamId string) *model.AppError {
+func (s SqlChannelStore) PermanentDeleteByTeam(teamId string) error {
 	transaction, err := s.GetMaster().Begin()
 	if err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDeleteByTeam", "store.sql_channel.permanent_delete_by_team.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return errors.Wrap(err, "PermanentDeleteByTeam: begin_transaction")
 	}
 	defer finalizeTransaction(transaction)
 
 	if err := s.permanentDeleteByTeamtT(transaction, teamId); err != nil {
-		return err
+		return errors.Wrap(err, "permanentDeleteByTeamtT")
 	}
 
 	// Additionally propagate the deletions to the PublicChannels table.
@@ -788,34 +861,34 @@ func (s SqlChannelStore) PermanentDeleteByTeam(teamId string) *model.AppError {
 		`, map[string]interface{}{
 		"TeamId": teamId,
 	}); err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDeleteByTeamt", "store.sql_channel.permanent_delete_by_team.delete_public_channels.app_error", nil, "team_id="+teamId+", "+err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "failed to delete public channels by team with teamId=%s", teamId)
 	}
 
 	if err := transaction.Commit(); err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDeleteByTeam", "store.sql_channel.permanent_delete_by_team.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return errors.Wrap(err, "PermanentDeleteByTeam: commit_transaction")
 	}
 
 	return nil
 }
 
-func (s SqlChannelStore) permanentDeleteByTeamtT(transaction *gorp.Transaction, teamId string) *model.AppError {
+func (s SqlChannelStore) permanentDeleteByTeamtT(transaction *gorp.Transaction, teamId string) error {
 	if _, err := transaction.Exec("DELETE FROM Channels WHERE TeamId = :TeamId", map[string]interface{}{"TeamId": teamId}); err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDeleteByTeam", "store.sql_channel.permanent_delete_by_team.app_error", nil, "teamId="+teamId+", "+err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "failed to delete channel by team with teamId=%s", teamId)
 	}
 
 	return nil
 }
 
 // PermanentDelete removes the given channel from the database.
-func (s SqlChannelStore) PermanentDelete(channelId string) *model.AppError {
+func (s SqlChannelStore) PermanentDelete(channelId string) error {
 	transaction, err := s.GetMaster().Begin()
 	if err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDelete", "store.sql_channel.permanent_delete.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return errors.Wrap(err, "PermanentDelete: begin_transaction")
 	}
 	defer finalizeTransaction(transaction)
 
 	if err := s.permanentDeleteT(transaction, channelId); err != nil {
-		return err
+		return errors.Wrap(err, "permanentDeleteT")
 	}
 
 	// Additionally propagate the deletion to the PublicChannels table.
@@ -827,19 +900,19 @@ func (s SqlChannelStore) PermanentDelete(channelId string) *model.AppError {
 		`, map[string]interface{}{
 		"ChannelId": channelId,
 	}); err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDelete", "store.sql_channel.permanent_delete.delete_public_channel.app_error", nil, "channel_id="+channelId+", "+err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "failed to delete public channels with id=%s", channelId)
 	}
 
 	if err := transaction.Commit(); err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDelete", "store.sql_channel.permanent_delete.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return errors.Wrap(err, "PermanentDelete: commit_transaction")
 	}
 
 	return nil
 }
 
-func (s SqlChannelStore) permanentDeleteT(transaction *gorp.Transaction, channelId string) *model.AppError {
+func (s SqlChannelStore) permanentDeleteT(transaction *gorp.Transaction, channelId string) error {
 	if _, err := transaction.Exec("DELETE FROM Channels WHERE Id = :ChannelId", map[string]interface{}{"ChannelId": channelId}); err != nil {
-		return model.NewAppError("SqlChannelStore.PermanentDelete", "store.sql_channel.permanent_delete.app_error", nil, "channel_id="+channelId+", "+err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "failed to delete channel with id=%s", channelId)
 	}
 
 	return nil
@@ -854,56 +927,85 @@ func (s SqlChannelStore) PermanentDeleteMembersByChannel(channelId string) *mode
 	return nil
 }
 
-func (s SqlChannelStore) GetChannels(teamId string, userId string, includeDeleted bool) (*model.ChannelList, *model.AppError) {
-	query := "SELECT Channels.* FROM Channels, ChannelMembers WHERE Id = ChannelId AND UserId = :UserId AND DeleteAt = 0 AND (TeamId = :TeamId OR TeamId = '') ORDER BY DisplayName"
-	if includeDeleted {
-		query = "SELECT Channels.* FROM Channels, ChannelMembers WHERE Id = ChannelId AND UserId = :UserId AND (TeamId = :TeamId OR TeamId = '') ORDER BY DisplayName"
-	}
-	channels := &model.ChannelList{}
-	_, err := s.GetReplica().Select(channels, query, map[string]interface{}{"TeamId": teamId, "UserId": userId})
+func (s SqlChannelStore) GetChannels(teamId string, userId string, includeDeleted bool, lastDeleteAt int) (*model.ChannelList, error) {
+	query := s.getQueryBuilder().
+		Select("Channels.*").
+		From("Channels, ChannelMembers").
+		Where(
+			sq.And{
+				sq.Expr("Id = ChannelId"),
+				sq.Eq{"UserId": userId},
+				sq.Or{
+					sq.Eq{"TeamId": teamId},
+					sq.Eq{"TeamId": ""},
+				},
+			},
+		).
+		OrderBy("DisplayName")
 
+	if includeDeleted {
+		if lastDeleteAt != 0 {
+			// We filter by non-archived, and archived >= a timestamp.
+			query = query.Where(sq.Or{
+				sq.Eq{"DeleteAt": 0},
+				sq.GtOrEq{"DeleteAt": lastDeleteAt},
+			})
+		}
+		// If lastDeleteAt is not set, we include everything. That means no filter is needed.
+	} else {
+		// Don't include archived channels.
+		query = query.Where(sq.Eq{"DeleteAt": 0})
+	}
+
+	channels := &model.ChannelList{}
+	sql, args, err := query.ToSql()
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.GetChannels", "store.sql_channel.get_channels.get.app_error", nil, "teamId="+teamId+", userId="+userId+", err="+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "getchannels_tosql")
+	}
+
+	_, err = s.GetReplica().Select(channels, sql, args...)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get channels with TeamId=%s and UserId=%s", teamId, userId)
 	}
 
 	if len(*channels) == 0 {
-		return nil, model.NewAppError("SqlChannelStore.GetChannels", "store.sql_channel.get_channels.not_found.app_error", nil, "teamId="+teamId+", userId="+userId, http.StatusBadRequest)
+		return nil, store.NewErrNotFound("Channel", "userId="+userId)
 	}
 
 	return channels, nil
 }
 
-func (s SqlChannelStore) GetAllChannels(offset, limit int, opts store.ChannelSearchOpts) (*model.ChannelListWithTeamData, *model.AppError) {
+func (s SqlChannelStore) GetAllChannels(offset, limit int, opts store.ChannelSearchOpts) (*model.ChannelListWithTeamData, error) {
 	query := s.getAllChannelsQuery(opts, false)
 
 	query = query.OrderBy("c.DisplayName, Teams.DisplayName").Limit(uint64(limit)).Offset(uint64(offset))
 
 	queryString, args, err := query.ToSql()
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.GetAllChannels", "store.sql.build_query.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "failed to create query")
 	}
 
 	data := &model.ChannelListWithTeamData{}
 	_, err = s.GetReplica().Select(data, queryString, args...)
 
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.GetAllChannels", "store.sql_channel.get_all_channels.get.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrap(err, "failed to get all channels")
 	}
 
 	return data, nil
 }
 
-func (s SqlChannelStore) GetAllChannelsCount(opts store.ChannelSearchOpts) (int64, *model.AppError) {
+func (s SqlChannelStore) GetAllChannelsCount(opts store.ChannelSearchOpts) (int64, error) {
 	query := s.getAllChannelsQuery(opts, true)
 
 	queryString, args, err := query.ToSql()
 	if err != nil {
-		return 0, model.NewAppError("SqlChannelStore.GetAllChannelsCount", "store.sql.build_query.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return 0, errors.Wrap(err, "failed to create query")
 	}
 
 	count, err := s.GetReplica().SelectInt(queryString, args...)
 	if err != nil {
-		return 0, model.NewAppError("SqlChannelStore.GetAllChannelsCount", "store.sql_channel.get_all_channels.get.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return 0, errors.Wrap(err, "failed to count all channels")
 	}
 
 	return count, nil
@@ -941,7 +1043,7 @@ func (s SqlChannelStore) getAllChannelsQuery(opts store.ChannelSearchOpts, forCo
 	return query
 }
 
-func (s SqlChannelStore) GetMoreChannels(teamId string, userId string, offset int, limit int) (*model.ChannelList, *model.AppError) {
+func (s SqlChannelStore) GetMoreChannels(teamId string, userId string, offset int, limit int) (*model.ChannelList, error) {
 	channels := &model.ChannelList{}
 	_, err := s.GetReplica().Select(channels, `
 		SELECT
@@ -977,9 +1079,32 @@ func (s SqlChannelStore) GetMoreChannels(teamId string, userId string, offset in
 	})
 
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.GetMoreChannels", "store.sql_channel.get_more_channels.get.app_error", nil, "teamId="+teamId+", userId="+userId+", err="+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "failed getting channels with teamId=%s and userId=%s", teamId, userId)
 	}
 
+	return channels, nil
+}
+
+func (s SqlChannelStore) GetPrivateChannelsForTeam(teamId string, offset int, limit int) (*model.ChannelList, *model.AppError) {
+	channels := &model.ChannelList{}
+
+	query := s.getQueryBuilder().
+		Select("*").
+		From("Channels").
+		Where(sq.Eq{"Type": model.CHANNEL_PRIVATE, "TeamId": teamId, "DeleteAt": 0}).
+		OrderBy("DisplayName").
+		Limit(uint64(limit)).
+		Offset(uint64(offset))
+
+	sql, args, err := query.ToSql()
+	if err != nil {
+		return nil, model.NewAppError("SqlChannelStore.GetPrivateChannelsForTeam", "store.sql_channel.get_private_channels.get.app_error", nil, "teamId="+teamId+", err="+err.Error(), http.StatusInternalServerError)
+	}
+
+	_, err = s.GetReplica().Select(channels, sql, args...)
+	if err != nil {
+		return nil, model.NewAppError("SqlChannelStore.GetPrivateChannelsForTeam", "store.sql_channel.get_private_channels.get.app_error", nil, "teamId="+teamId+", err="+err.Error(), http.StatusInternalServerError)
+	}
 	return channels, nil
 }
 
@@ -1081,21 +1206,23 @@ func (s SqlChannelStore) GetTeamChannels(teamId string) (*model.ChannelList, *mo
 	_, err := s.GetReplica().Select(data, "SELECT * FROM Channels WHERE TeamId = :TeamId And Type != 'D' ORDER BY DisplayName", map[string]interface{}{"TeamId": teamId})
 
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.GetTeamChannels", "store.sql_channel.get_channels.get.app_error", nil, "teamId="+teamId+",  err="+err.Error(), http.StatusInternalServerError)
+		// TODO: This error key would go away once this store method is migrated to return plain errors
+		return nil, model.NewAppError("SqlChannelStore.GetTeamChannels", "app.channel.get_channels.get.app_error", nil, "teamId="+teamId+",  err="+err.Error(), http.StatusInternalServerError)
 	}
 
 	if len(*data) == 0 {
-		return nil, model.NewAppError("SqlChannelStore.GetTeamChannels", "store.sql_channel.get_channels.not_found.app_error", nil, "teamId="+teamId, http.StatusNotFound)
+		// TODO: This error key would go away once this store method is migrated to return plain errors
+		return nil, model.NewAppError("SqlChannelStore.GetTeamChannels", "app.channel.get_channels.not_found.app_error", nil, "teamId="+teamId, http.StatusNotFound)
 	}
 
 	return data, nil
 }
 
-func (s SqlChannelStore) GetByName(teamId string, name string, allowFromCache bool) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) GetByName(teamId string, name string, allowFromCache bool) (*model.Channel, error) {
 	return s.getByName(teamId, name, false, allowFromCache)
 }
 
-func (s SqlChannelStore) GetByNames(teamId string, names []string, allowFromCache bool) ([]*model.Channel, *model.AppError) {
+func (s SqlChannelStore) GetByNames(teamId string, names []string, allowFromCache bool) ([]*model.Channel, error) {
 	var channels []*model.Channel
 
 	if allowFromCache {
@@ -1106,8 +1233,9 @@ func (s SqlChannelStore) GetByNames(teamId string, names []string, allowFromCach
 				continue
 			}
 			visited[name] = struct{}{}
-			if cacheItem, ok := channelByNameCache.Get(teamId + name); ok {
-				channels = append(channels, cacheItem.(*model.Channel))
+			var cacheItem *model.Channel
+			if err := channelByNameCache.Get(teamId+name, &cacheItem); err == nil {
+				channels = append(channels, cacheItem)
 			} else {
 				misses = append(misses, name)
 			}
@@ -1134,10 +1262,14 @@ func (s SqlChannelStore) GetByNames(teamId string, names []string, allowFromCach
 
 		var dbChannels []*model.Channel
 		if _, err := s.GetReplica().Select(&dbChannels, query, props); err != nil && err != sql.ErrNoRows {
-			return nil, model.NewAppError("SqlChannelStore.GetByName", "store.sql_channel.get_by_name.existing.app_error", nil, "teamId="+teamId+", "+err.Error(), http.StatusInternalServerError)
+			msg := fmt.Sprintf("failed to get channels with names=%v", names)
+			if teamId != "" {
+				msg += fmt.Sprintf("teamId=%s", teamId)
+			}
+			return nil, errors.Wrap(err, msg)
 		}
 		for _, channel := range dbChannels {
-			channelByNameCache.AddWithExpiresInSecs(teamId+channel.Name, channel, CHANNEL_CACHE_SEC)
+			channelByNameCache.SetWithExpiry(teamId+channel.Name, channel, CHANNEL_CACHE_DURATION)
 			channels = append(channels, channel)
 		}
 		// Not all channels are in cache. Increment aggregate miss counter.
@@ -1154,11 +1286,11 @@ func (s SqlChannelStore) GetByNames(teamId string, names []string, allowFromCach
 	return channels, nil
 }
 
-func (s SqlChannelStore) GetByNameIncludeDeleted(teamId string, name string, allowFromCache bool) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) GetByNameIncludeDeleted(teamId string, name string, allowFromCache bool) (*model.Channel, error) {
 	return s.getByName(teamId, name, true, allowFromCache)
 }
 
-func (s SqlChannelStore) getByName(teamId string, name string, includeDeleted bool, allowFromCache bool) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) getByName(teamId string, name string, includeDeleted bool, allowFromCache bool) (*model.Channel, error) {
 	var query string
 	if includeDeleted {
 		query = "SELECT * FROM Channels WHERE (TeamId = :TeamId OR TeamId = '') AND Name = :Name"
@@ -1168,11 +1300,12 @@ func (s SqlChannelStore) getByName(teamId string, name string, includeDeleted bo
 	channel := model.Channel{}
 
 	if allowFromCache {
-		if cacheItem, ok := channelByNameCache.Get(teamId + name); ok {
+		var cacheItem *model.Channel
+		if err := channelByNameCache.Get(teamId+name, &cacheItem); err == nil {
 			if s.metrics != nil {
 				s.metrics.IncrementMemCacheHitCounter("Channel By Name")
 			}
-			return cacheItem.(*model.Channel), nil
+			return cacheItem, nil
 		}
 		if s.metrics != nil {
 			s.metrics.IncrementMemCacheMissCounter("Channel By Name")
@@ -1181,29 +1314,29 @@ func (s SqlChannelStore) getByName(teamId string, name string, includeDeleted bo
 
 	if err := s.GetReplica().SelectOne(&channel, query, map[string]interface{}{"TeamId": teamId, "Name": name}); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, model.NewAppError("SqlChannelStore.GetByName", store.MISSING_CHANNEL_ERROR, nil, "teamId="+teamId+", "+"name="+name+", "+err.Error(), http.StatusNotFound)
+			return nil, store.NewErrNotFound("Channel", fmt.Sprintf("TeamId=%s&Name=%s", teamId, name))
 		}
-		return nil, model.NewAppError("SqlChannelStore.GetByName", "store.sql_channel.get_by_name.existing.app_error", nil, "teamId="+teamId+", "+"name="+name+", "+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "failed to find channel with TeamId=%s and Name=%s", teamId, name)
 	}
 
-	channelByNameCache.AddWithExpiresInSecs(teamId+name, &channel, CHANNEL_CACHE_SEC)
+	channelByNameCache.SetWithExpiry(teamId+name, &channel, CHANNEL_CACHE_DURATION)
 	return &channel, nil
 }
 
-func (s SqlChannelStore) GetDeletedByName(teamId string, name string) (*model.Channel, *model.AppError) {
+func (s SqlChannelStore) GetDeletedByName(teamId string, name string) (*model.Channel, error) {
 	channel := model.Channel{}
 
 	if err := s.GetReplica().SelectOne(&channel, "SELECT * FROM Channels WHERE (TeamId = :TeamId OR TeamId = '') AND Name = :Name AND DeleteAt != 0", map[string]interface{}{"TeamId": teamId, "Name": name}); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, model.NewAppError("SqlChannelStore.GetDeletedByName", "store.sql_channel.get_deleted_by_name.missing.app_error", nil, "teamId="+teamId+", "+"name="+name+", "+err.Error(), http.StatusNotFound)
+			return nil, store.NewErrNotFound("Channel", fmt.Sprintf("name=%s", name))
 		}
-		return nil, model.NewAppError("SqlChannelStore.GetDeletedByName", "store.sql_channel.get_deleted_by_name.existing.app_error", nil, "teamId="+teamId+", "+"name="+name+", "+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "failed to get channel by teamId=%s and name=%s", teamId, name)
 	}
 
 	return &channel, nil
 }
 
-func (s SqlChannelStore) GetDeleted(teamId string, offset int, limit int, userId string) (*model.ChannelList, *model.AppError) {
+func (s SqlChannelStore) GetDeleted(teamId string, offset int, limit int, userId string) (*model.ChannelList, error) {
 	channels := &model.ChannelList{}
 
 	query := `
@@ -1222,9 +1355,9 @@ func (s SqlChannelStore) GetDeleted(teamId string, offset int, limit int, userId
 
 	if _, err := s.GetReplica().Select(channels, query, map[string]interface{}{"TeamId": teamId, "Limit": limit, "Offset": offset, "UserId": userId}); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, model.NewAppError("SqlChannelStore.GetDeleted", "store.sql_channel.get_deleted.missing.app_error", nil, "teamId="+teamId+", "+err.Error(), http.StatusNotFound)
+			return nil, store.NewErrNotFound("Channel", fmt.Sprintf("TeamId=%s,UserId=%s", teamId, userId))
 		}
-		return nil, model.NewAppError("SqlChannelStore.GetDeleted", "store.sql_channel.get_deleted.existing.app_error", nil, "teamId="+teamId+", "+err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "failed to get deleted channels with TeamId=%s and UserId=%s", teamId, userId)
 	}
 
 	return channels, nil
@@ -1251,13 +1384,9 @@ var CHANNEL_MEMBERS_WITH_SCHEME_SELECT_QUERY = `
 		Schemes TeamScheme ON Teams.SchemeId = TeamScheme.Id
 `
 
-func (s SqlChannelStore) SaveMember(member *model.ChannelMember) (*model.ChannelMember, *model.AppError) {
-	defer s.InvalidateAllChannelMembersForUser(member.UserId)
-
-	// Grab the channel we are saving this member to
-	channel, errCh := s.GetFromMaster(member.ChannelId)
-	if errCh != nil {
-		return nil, errCh
+func (s SqlChannelStore) SaveMultipleMembers(members []*model.ChannelMember) ([]*model.ChannelMember, *model.AppError) {
+	for _, member := range members {
+		defer s.InvalidateAllChannelMembersForUser(member.UserId)
 	}
 
 	transaction, err := s.GetMaster().Begin()
@@ -1266,64 +1395,234 @@ func (s SqlChannelStore) SaveMember(member *model.ChannelMember) (*model.Channel
 	}
 	defer finalizeTransaction(transaction)
 
-	newMember, appErr := s.saveMemberT(transaction, member, channel)
-	if appErr != nil {
-		return nil, appErr
+	newMembers, err := s.saveMultipleMembersT(transaction, members)
+	if err != nil { // TODO: this will go away once SaveMultipleMembers is migrated too.
+		var cErr *store.ErrConflict
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &cErr):
+			switch cErr.Resource {
+			case "ChannelMembers":
+				return nil, model.NewAppError("CreateChannel", "store.sql_channel.save_member.exists.app_error", nil, cErr.Error(), http.StatusBadRequest)
+			}
+		case errors.As(err, &appErr): // in case we haven't converted to plain error.
+			return nil, appErr
+		default: // last fallback in case it doesn't map to an existing app error.
+			// TODO: This error key would go away once this store method is migrated to return plain errors
+			return nil, model.NewAppError("CreateDirectChannel", "app.channel.create_direct_channel.internal_error", nil, err.Error(), http.StatusInternalServerError)
+		}
 	}
 
 	if err := transaction.Commit(); err != nil {
 		return nil, model.NewAppError("SqlChannelStore.SaveMember", "store.sql_channel.save_member.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
-	return newMember, nil
+	return newMembers, nil
 }
 
-func (s SqlChannelStore) saveMemberT(transaction *gorp.Transaction, member *model.ChannelMember, channel *model.Channel) (*model.ChannelMember, *model.AppError) {
-	member.PreSave()
-	if err := member.IsValid(); err != nil {
+func (s SqlChannelStore) SaveMember(member *model.ChannelMember) (*model.ChannelMember, *model.AppError) {
+	newMembers, appErr := s.SaveMultipleMembers([]*model.ChannelMember{member})
+	if appErr != nil {
+		return nil, appErr
+	}
+	return newMembers[0], nil
+}
+
+func (s SqlChannelStore) saveMultipleMembersT(transaction *gorp.Transaction, members []*model.ChannelMember) ([]*model.ChannelMember, error) {
+	newChannelMembers := map[string]int{}
+	users := map[string]bool{}
+	for _, member := range members {
+		if val, ok := newChannelMembers[member.ChannelId]; val < 1 || !ok {
+			newChannelMembers[member.ChannelId] = 1
+		} else {
+			newChannelMembers[member.ChannelId]++
+		}
+		users[member.UserId] = true
+
+		member.PreSave()
+		if err := member.IsValid(); err != nil { // TODO: this needs to return plain error in v6.
+			return nil, err
+		}
+	}
+
+	channels := []string{}
+	for channel := range newChannelMembers {
+		channels = append(channels, channel)
+	}
+
+	defaultChannelRolesByChannel := map[string]struct {
+		Id    string
+		Guest sql.NullString
+		User  sql.NullString
+		Admin sql.NullString
+	}{}
+
+	channelRolesQuery := s.getQueryBuilder().
+		Select(
+			"Channels.Id as Id",
+			"ChannelScheme.DefaultChannelGuestRole as Guest",
+			"ChannelScheme.DefaultChannelUserRole as User",
+			"ChannelScheme.DefaultChannelAdminRole as Admin",
+		).
+		From("Channels").
+		LeftJoin("Schemes ChannelScheme ON Channels.SchemeId = ChannelScheme.Id").
+		Where(sq.Eq{"Channels.Id": channels})
+
+	channelRolesSql, channelRolesArgs, err := channelRolesQuery.ToSql()
+	if err != nil {
+		return nil, errors.Wrap(err, "channel_roles_tosql")
+	}
+
+	var defaultChannelsRoles []struct {
+		Id    string
+		Guest sql.NullString
+		User  sql.NullString
+		Admin sql.NullString
+	}
+	_, err = s.GetMaster().Select(&defaultChannelsRoles, channelRolesSql, channelRolesArgs...)
+	if err != nil {
+		return nil, errors.Wrap(err, "default_channel_roles_select")
+	}
+
+	for _, defaultRoles := range defaultChannelsRoles {
+		defaultChannelRolesByChannel[defaultRoles.Id] = defaultRoles
+	}
+
+	defaultTeamRolesByChannel := map[string]struct {
+		Id    string
+		Guest sql.NullString
+		User  sql.NullString
+		Admin sql.NullString
+	}{}
+
+	teamRolesQuery := s.getQueryBuilder().
+		Select(
+			"Channels.Id as Id",
+			"TeamScheme.DefaultChannelGuestRole as Guest",
+			"TeamScheme.DefaultChannelUserRole as User",
+			"TeamScheme.DefaultChannelAdminRole as Admin",
+		).
+		From("Channels").
+		LeftJoin("Teams ON Teams.Id = Channels.TeamId").
+		LeftJoin("Schemes TeamScheme ON Teams.SchemeId = TeamScheme.Id").
+		Where(sq.Eq{"Channels.Id": channels})
+
+	teamRolesSql, teamRolesArgs, err := teamRolesQuery.ToSql()
+	if err != nil {
+		return nil, errors.Wrap(err, "team_roles_tosql")
+	}
+
+	var defaultTeamsRoles []struct {
+		Id    string
+		Guest sql.NullString
+		User  sql.NullString
+		Admin sql.NullString
+	}
+	_, err = s.GetMaster().Select(&defaultTeamsRoles, teamRolesSql, teamRolesArgs...)
+	if err != nil {
+		return nil, errors.Wrap(err, "default_team_roles_select")
+	}
+
+	for _, defaultRoles := range defaultTeamsRoles {
+		defaultTeamRolesByChannel[defaultRoles.Id] = defaultRoles
+	}
+
+	query := s.getQueryBuilder().Insert("ChannelMembers").Columns(channelMemberSliceColumns()...)
+	for _, member := range members {
+		query = query.Values(channelMemberToSlice(member)...)
+	}
+
+	sql, args, err := query.ToSql()
+	if err != nil {
+		return nil, errors.Wrap(err, "channel_members_tosql")
+	}
+
+	if _, err := s.GetMaster().Exec(sql, args...); err != nil {
+		if IsUniqueConstraintError(err, []string{"ChannelId", "channelmembers_pkey", "PRIMARY"}) {
+			return nil, store.NewErrConflict("ChannelMembers", err, "")
+		}
+		return nil, errors.Wrap(err, "channel_members_save")
+	}
+
+	newMembers := []*model.ChannelMember{}
+	for _, member := range members {
+		defaultTeamGuestRole := defaultTeamRolesByChannel[member.ChannelId].Guest.String
+		defaultTeamUserRole := defaultTeamRolesByChannel[member.ChannelId].User.String
+		defaultTeamAdminRole := defaultTeamRolesByChannel[member.ChannelId].Admin.String
+		defaultChannelGuestRole := defaultChannelRolesByChannel[member.ChannelId].Guest.String
+		defaultChannelUserRole := defaultChannelRolesByChannel[member.ChannelId].User.String
+		defaultChannelAdminRole := defaultChannelRolesByChannel[member.ChannelId].Admin.String
+		rolesResult := getChannelRoles(
+			member.SchemeGuest, member.SchemeUser, member.SchemeAdmin,
+			defaultTeamGuestRole, defaultTeamUserRole, defaultTeamAdminRole,
+			defaultChannelGuestRole, defaultChannelUserRole, defaultChannelAdminRole,
+			strings.Fields(member.ExplicitRoles),
+		)
+		newMember := *member
+		newMember.SchemeGuest = rolesResult.schemeGuest
+		newMember.SchemeUser = rolesResult.schemeUser
+		newMember.SchemeAdmin = rolesResult.schemeAdmin
+		newMember.Roles = strings.Join(rolesResult.roles, " ")
+		newMember.ExplicitRoles = strings.Join(rolesResult.explicitRoles, " ")
+		newMembers = append(newMembers, &newMember)
+	}
+	return newMembers, nil
+}
+
+func (s SqlChannelStore) saveMemberT(transaction *gorp.Transaction, member *model.ChannelMember) (*model.ChannelMember, error) {
+	members, err := s.saveMultipleMembersT(transaction, []*model.ChannelMember{member})
+	if err != nil {
 		return nil, err
 	}
+	return members[0], nil
+}
 
-	dbMember := NewChannelMemberFromModel(member)
+func (s SqlChannelStore) UpdateMultipleMembers(members []*model.ChannelMember) ([]*model.ChannelMember, *model.AppError) {
+	for _, member := range members {
+		member.PreUpdate()
 
-	if err := transaction.Insert(dbMember); err != nil {
-		if IsUniqueConstraintError(err, []string{"ChannelId", "channelmembers_pkey"}) {
-			return nil, model.NewAppError("SqlChannelStore.SaveMember", "store.sql_channel.save_member.exists.app_error", nil, "channel_id="+member.ChannelId+", user_id="+member.UserId+", "+err.Error(), http.StatusBadRequest)
+		if err := member.IsValid(); err != nil {
+			return nil, err
 		}
-		return nil, model.NewAppError("SqlChannelStore.SaveMember", "store.sql_channel.save_member.save.app_error", nil, "channel_id="+member.ChannelId+", user_id="+member.UserId+", "+err.Error(), http.StatusInternalServerError)
 	}
 
-	var retrievedMember channelMemberWithSchemeRoles
-	if err := transaction.SelectOne(&retrievedMember, CHANNEL_MEMBERS_WITH_SCHEME_SELECT_QUERY+"WHERE ChannelMembers.ChannelId = :ChannelId AND ChannelMembers.UserId = :UserId", map[string]interface{}{"ChannelId": dbMember.ChannelId, "UserId": dbMember.UserId}); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, model.NewAppError("SqlChannelStore.GetMember", store.MISSING_CHANNEL_MEMBER_ERROR, nil, "channel_id="+dbMember.ChannelId+"user_id="+dbMember.UserId+","+err.Error(), http.StatusNotFound)
+	var transaction *gorp.Transaction
+	var err error
+
+	if transaction, err = s.GetMaster().Begin(); err != nil {
+		return nil, model.NewAppError("SqlChannelStore.MigrateChannelMembers", "store.sql_channel.migrate_channel_members.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+	defer finalizeTransaction(transaction)
+
+	updatedMembers := []*model.ChannelMember{}
+	for _, member := range members {
+		if _, err := transaction.Update(NewChannelMemberFromModel(member)); err != nil {
+			return nil, model.NewAppError("SqlChannelStore.UpdateMember", "store.sql_channel.update_member.app_error", nil, "channel_id="+member.ChannelId+", "+"user_id="+member.UserId+", "+err.Error(), http.StatusInternalServerError)
 		}
-		return nil, model.NewAppError("SqlChannelStore.GetMember", "store.sql_channel.get_member.app_error", nil, "channel_id="+dbMember.ChannelId+"user_id="+dbMember.UserId+","+err.Error(), http.StatusInternalServerError)
+
+		// TODO: Get this out of the transaction when is possible
+		var dbMember channelMemberWithSchemeRoles
+		if err := transaction.SelectOne(&dbMember, CHANNEL_MEMBERS_WITH_SCHEME_SELECT_QUERY+"WHERE ChannelMembers.ChannelId = :ChannelId AND ChannelMembers.UserId = :UserId", map[string]interface{}{"ChannelId": member.ChannelId, "UserId": member.UserId}); err != nil {
+			if err == sql.ErrNoRows {
+				return nil, model.NewAppError("SqlChannelStore.GetMember", store.MISSING_CHANNEL_MEMBER_ERROR, nil, "channel_id="+member.ChannelId+"user_id="+member.UserId+","+err.Error(), http.StatusNotFound)
+			}
+			return nil, model.NewAppError("SqlChannelStore.GetMember", "store.sql_channel.get_member.app_error", nil, "channel_id="+member.ChannelId+"user_id="+member.UserId+","+err.Error(), http.StatusInternalServerError)
+		}
+		updatedMembers = append(updatedMembers, dbMember.ToModel())
 	}
 
-	return retrievedMember.ToModel(), nil
+	if err := transaction.Commit(); err != nil {
+		return nil, model.NewAppError("SqlChannelStore.MigrateChannelMembers", "store.sql_channel.migrate_channel_members.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+	return updatedMembers, nil
 }
 
 func (s SqlChannelStore) UpdateMember(member *model.ChannelMember) (*model.ChannelMember, *model.AppError) {
-	member.PreUpdate()
-
-	if err := member.IsValid(); err != nil {
+	updatedMembers, err := s.UpdateMultipleMembers([]*model.ChannelMember{member})
+	if err != nil {
 		return nil, err
 	}
-
-	if _, err := s.GetMaster().Update(NewChannelMemberFromModel(member)); err != nil {
-		return nil, model.NewAppError("SqlChannelStore.UpdateMember", "store.sql_channel.update_member.app_error", nil, "channel_id="+member.ChannelId+", "+"user_id="+member.UserId+", "+err.Error(), http.StatusInternalServerError)
-	}
-
-	var dbMember channelMemberWithSchemeRoles
-
-	if err := s.GetReplica().SelectOne(&dbMember, CHANNEL_MEMBERS_WITH_SCHEME_SELECT_QUERY+"WHERE ChannelMembers.ChannelId = :ChannelId AND ChannelMembers.UserId = :UserId", map[string]interface{}{"ChannelId": member.ChannelId, "UserId": member.UserId}); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, model.NewAppError("SqlChannelStore.GetMember", store.MISSING_CHANNEL_MEMBER_ERROR, nil, "channel_id="+member.ChannelId+"user_id="+member.UserId+","+err.Error(), http.StatusNotFound)
-		}
-		return nil, model.NewAppError("SqlChannelStore.GetMember", "store.sql_channel.get_member.app_error", nil, "channel_id="+member.ChannelId+"user_id="+member.UserId+","+err.Error(), http.StatusInternalServerError)
-	}
-	return dbMember.ToModel(), nil
+	return updatedMembers[0], nil
 }
 
 func (s SqlChannelStore) GetMembers(channelId string, offset, limit int) (*model.ChannelMembers, *model.AppError) {
@@ -1377,11 +1676,11 @@ func (s SqlChannelStore) InvalidateAllChannelMembersForUser(userId string) {
 }
 
 func (s SqlChannelStore) IsUserInChannelUseCache(userId string, channelId string) bool {
-	if cacheItem, ok := allChannelMembersForUserCache.Get(userId); ok {
+	var ids map[string]string
+	if err := allChannelMembersForUserCache.Get(userId, &ids); err == nil {
 		if s.metrics != nil {
 			s.metrics.IncrementMemCacheHitCounter("All Channel Members for User")
 		}
-		ids := cacheItem.(map[string]string)
 		if _, ok := ids[channelId]; ok {
 			return true
 		}
@@ -1444,11 +1743,11 @@ func (s SqlChannelStore) GetAllChannelMembersForUser(userId string, allowFromCac
 		cache_key += "_deleted"
 	}
 	if allowFromCache {
-		if cacheItem, ok := allChannelMembersForUserCache.Get(cache_key); ok {
+		var ids map[string]string
+		if err := allChannelMembersForUserCache.Get(cache_key, &ids); err == nil {
 			if s.metrics != nil {
 				s.metrics.IncrementMemCacheHitCounter("All Channel Members for User")
 			}
-			ids := cacheItem.(map[string]string)
 			return ids, nil
 		}
 	}
@@ -1457,44 +1756,69 @@ func (s SqlChannelStore) GetAllChannelMembersForUser(userId string, allowFromCac
 		s.metrics.IncrementMemCacheMissCounter("All Channel Members for User")
 	}
 
-	var deletedClause string
-	if !includeDeleted {
-		deletedClause = "Channels.DeleteAt = 0 AND"
+	failure := func(err error) *model.AppError {
+		// TODO: This error key would go away once this store method is migrated to return plain errors
+		return model.NewAppError(
+			"SqlChannelStore.GetAllChannelMembersForUser",
+			"app.channel.get_channels.get.app_error",
+			nil,
+			"userId="+userId+", err="+err.Error(),
+			http.StatusInternalServerError,
+		)
 	}
 
-	var data allChannelMembers
-	_, err := s.GetReplica().Select(&data, `
-			SELECT
-				ChannelMembers.ChannelId, ChannelMembers.Roles,
-				ChannelMembers.SchemeGuest, ChannelMembers.SchemeUser, ChannelMembers.SchemeAdmin,
+	query := s.getQueryBuilder().
+		Select(`
+				ChannelMembers.ChannelId, ChannelMembers.Roles, ChannelMembers.SchemeGuest,
+				ChannelMembers.SchemeUser, ChannelMembers.SchemeAdmin,
 				TeamScheme.DefaultChannelGuestRole TeamSchemeDefaultGuestRole,
 				TeamScheme.DefaultChannelUserRole TeamSchemeDefaultUserRole,
 				TeamScheme.DefaultChannelAdminRole TeamSchemeDefaultAdminRole,
 				ChannelScheme.DefaultChannelGuestRole ChannelSchemeDefaultGuestRole,
 				ChannelScheme.DefaultChannelUserRole ChannelSchemeDefaultUserRole,
 				ChannelScheme.DefaultChannelAdminRole ChannelSchemeDefaultAdminRole
-			FROM
-				ChannelMembers
-			INNER JOIN
-				Channels ON ChannelMembers.ChannelId = Channels.Id
-			LEFT JOIN
-				Schemes ChannelScheme ON Channels.SchemeId = ChannelScheme.Id
-			LEFT JOIN
-				Teams ON Channels.TeamId = Teams.Id
-			LEFT JOIN
-				Schemes TeamScheme ON Teams.SchemeId = TeamScheme.Id
-			WHERE
-				`+deletedClause+`
-				ChannelMembers.UserId = :UserId`, map[string]interface{}{"UserId": userId})
-
+		`).
+		From("ChannelMembers").
+		Join("Channels ON ChannelMembers.ChannelId = Channels.Id").
+		LeftJoin("Schemes ChannelScheme ON Channels.SchemeId = ChannelScheme.Id").
+		LeftJoin("Teams ON Channels.TeamId = Teams.Id").
+		LeftJoin("Schemes TeamScheme ON Teams.SchemeId = TeamScheme.Id").
+		Where(sq.Eq{"ChannelMembers.UserId": userId})
+	if !includeDeleted {
+		query = query.Where(sq.Eq{"Channels.DeleteAt": 0})
+	}
+	queryString, args, err := query.ToSql()
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelStore.GetAllChannelMembersForUser", "store.sql_channel.get_channels.get.app_error", nil, "userId="+userId+", err="+err.Error(), http.StatusInternalServerError)
+		return nil, failure(err)
 	}
 
+	rows, err := s.GetReplica().Db.Query(queryString, args...)
+	if err != nil {
+		return nil, failure(err)
+	}
+
+	var data allChannelMembers
+	defer rows.Close()
+	for rows.Next() {
+		var cm allChannelMember
+		err = rows.Scan(
+			&cm.ChannelId, &cm.Roles, &cm.SchemeGuest, &cm.SchemeUser,
+			&cm.SchemeAdmin, &cm.TeamSchemeDefaultGuestRole, &cm.TeamSchemeDefaultUserRole,
+			&cm.TeamSchemeDefaultAdminRole, &cm.ChannelSchemeDefaultGuestRole,
+			&cm.ChannelSchemeDefaultUserRole, &cm.ChannelSchemeDefaultAdminRole,
+		)
+		if err != nil {
+			return nil, failure(err)
+		}
+		data = append(data, cm)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, failure(err)
+	}
 	ids := data.ToMapStringString()
 
 	if allowFromCache {
-		allChannelMembersForUserCache.AddWithExpiresInSecs(cache_key, ids, ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_SEC)
+		allChannelMembersForUserCache.SetWithExpiry(cache_key, ids, ALL_CHANNEL_MEMBERS_FOR_USER_CACHE_DURATION)
 	}
 	return ids, nil
 }
@@ -1513,11 +1837,12 @@ type allChannelMemberNotifyProps struct {
 
 func (s SqlChannelStore) GetAllChannelMembersNotifyPropsForChannel(channelId string, allowFromCache bool) (map[string]model.StringMap, *model.AppError) {
 	if allowFromCache {
-		if cacheItem, ok := allChannelMembersNotifyPropsForChannelCache.Get(channelId); ok {
+		var cacheItem map[string]model.StringMap
+		if err := allChannelMembersNotifyPropsForChannelCache.Get(channelId, &cacheItem); err == nil {
 			if s.metrics != nil {
 				s.metrics.IncrementMemCacheHitCounter("All Channel Members Notify Props for Channel")
 			}
-			return cacheItem.(map[string]model.StringMap), nil
+			return cacheItem, nil
 		}
 	}
 
@@ -1540,7 +1865,7 @@ func (s SqlChannelStore) GetAllChannelMembersNotifyPropsForChannel(channelId str
 		props[data[i].UserId] = data[i].NotifyProps
 	}
 
-	allChannelMembersNotifyPropsForChannelCache.AddWithExpiresInSecs(channelId, props, ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_SEC)
+	allChannelMembersNotifyPropsForChannelCache.SetWithExpiry(channelId, props, ALL_CHANNEL_MEMBERS_NOTIFY_PROPS_FOR_CHANNEL_CACHE_DURATION)
 
 	return props, nil
 }
@@ -1569,6 +1894,76 @@ func (s SqlChannelStore) GetMemberCount(channelId string, allowFromCache bool) (
 	}
 
 	return count, nil
+}
+
+// GetMemberCountsByGroup returns a slice of ChannelMemberCountByGroup for a given channel
+// which contains the number of channel members for each group and optionally the number of unique timezones present for each group in the channel
+func (s SqlChannelStore) GetMemberCountsByGroup(channelID string, includeTimezones bool) ([]*model.ChannelMemberCountByGroup, *model.AppError) {
+	selectStr := "GroupMembers.GroupId, COUNT(ChannelMembers.UserId) AS ChannelMemberCount"
+
+	if includeTimezones {
+		// Length of default timezone (len {"automaticTimezone":"","manualTimezone":"","useAutomaticTimezone":"true"})
+		defaultTimezoneLength := `74`
+
+		// Beginning and end of the value for the automatic and manual timezones respectively
+		autoTimezone := `LOCATE(':', Users.Timezone) + 2`
+		autoTimezoneEnd := `LOCATE(',', Users.Timezone) - LOCATE(':', Users.Timezone) - 3`
+		manualTimezone := `LOCATE(',', Users.Timezone) + 19`
+		manualTimezoneEnd := `LOCATE('useAutomaticTimezone', Users.Timezone) - 22 - LOCATE(',', Users.Timezone)`
+
+		if s.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+			autoTimezone = `POSITION(':' IN Users.Timezone) + 2`
+			autoTimezoneEnd = `POSITION(',' IN Users.Timezone) - POSITION(':' IN Users.Timezone) - 3`
+			manualTimezone = `POSITION(',' IN Users.Timezone) + 19`
+			manualTimezoneEnd = `POSITION('useAutomaticTimezone' IN Users.Timezone) - 22 - POSITION(',' IN Users.Timezone)`
+		}
+
+		selectStr = `
+			GroupMembers.GroupId,
+			COUNT(ChannelMembers.UserId) AS ChannelMemberCount,
+			COUNT(DISTINCT
+				(
+					CASE WHEN Timezone like '%"useAutomaticTimezone":"true"}' AND LENGTH(Timezone) > ` + defaultTimezoneLength + `
+					THEN
+					SUBSTRING(
+						Timezone
+						FROM ` + autoTimezone + `
+						FOR ` + autoTimezoneEnd + `
+					)
+					WHEN Timezone like '%"useAutomaticTimezone":"false"}' AND LENGTH(Timezone) > ` + defaultTimezoneLength + `
+					THEN
+						SUBSTRING(
+						Timezone
+						FROM ` + manualTimezone + `
+						FOR ` + manualTimezoneEnd + `
+					)
+					END
+				)
+			) AS ChannelMemberTimezonesCount
+		`
+	}
+
+	query := s.getQueryBuilder().
+		Select(selectStr).
+		From("ChannelMembers").
+		Join("GroupMembers ON GroupMembers.UserId = ChannelMembers.UserId")
+
+	if includeTimezones {
+		query = query.Join("Users ON Users.Id = GroupMembers.UserId")
+	}
+
+	query = query.Where(sq.Eq{"ChannelMembers.ChannelId": channelID}).GroupBy("GroupMembers.GroupId")
+
+	queryString, args, err := query.ToSql()
+	if err != nil {
+		return nil, model.NewAppError("SqlChannelStore.GetMemberCountsByGroup", "store.sql.build_query.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+	var data []*model.ChannelMemberCountByGroup
+	if _, err = s.GetReplica().Select(&data, queryString, args...); err != nil {
+		return nil, model.NewAppError("SqlChannelStore.GetMemberCountsByGroup", "store.sql_channel.get_member_count.app_error", nil, "channel_id="+channelID+", "+err.Error(), http.StatusInternalServerError)
+	}
+
+	return data, nil
 }
 
 func (s SqlChannelStore) InvalidatePinnedPostCount(channelId string) {
@@ -1611,12 +2006,39 @@ func (s SqlChannelStore) GetGuestCount(channelId string, allowFromCache bool) (i
 	return count, nil
 }
 
-func (s SqlChannelStore) RemoveMember(channelId string, userId string) *model.AppError {
-	_, err := s.GetMaster().Exec("DELETE FROM ChannelMembers WHERE ChannelId = :ChannelId AND UserId = :UserId", map[string]interface{}{"ChannelId": channelId, "UserId": userId})
+func (s SqlChannelStore) RemoveMembers(channelId string, userIds []string) *model.AppError {
+	query := s.getQueryBuilder().
+		Delete("ChannelMembers").
+		Where(sq.Eq{"ChannelId": channelId}).
+		Where(sq.Eq{"UserId": userIds})
+	sql, args, err := query.ToSql()
 	if err != nil {
-		return model.NewAppError("SqlChannelStore.RemoveMember", "store.sql_channel.remove_member.app_error", nil, "channel_id="+channelId+", user_id="+userId+", "+err.Error(), http.StatusInternalServerError)
+		return model.NewAppError("SqlChannelStore.RemoveMember", "store.sql_channel.remove_member.app_error", nil, "channel_id="+channelId+", "+err.Error(), http.StatusInternalServerError)
+	}
+	_, err = s.GetMaster().Exec(sql, args...)
+	if err != nil {
+		return model.NewAppError("SqlChannelStore.RemoveMember", "store.sql_channel.remove_member.app_error", nil, "channel_id="+channelId+", "+err.Error(), http.StatusInternalServerError)
+	}
+
+	// cleanup sidebarchannels table if the user is no longer a member of that channel
+	sql, args, err = s.getQueryBuilder().
+		Delete("SidebarChannels").
+		Where(sq.And{
+			sq.Eq{"ChannelId": channelId},
+			sq.Eq{"UserId": userIds},
+		}).ToSql()
+	if err != nil {
+		return model.NewAppError("SqlChannelStore.RemoveMember", "store.sql_channel.remove_member.app_error", nil, "channel_id="+channelId+", "+err.Error(), http.StatusInternalServerError)
+	}
+	_, err = s.GetMaster().Exec(sql, args...)
+	if err != nil {
+		return model.NewAppError("SqlChannelStore.RemoveMember", "store.sql_channel.remove_member.app_error", nil, "channel_id="+channelId+", "+err.Error(), http.StatusInternalServerError)
 	}
 	return nil
+}
+
+func (s SqlChannelStore) RemoveMember(channelId string, userId string) *model.AppError {
+	return s.RemoveMembers(channelId, []string{userId})
 }
 
 func (s SqlChannelStore) RemoveAllDeactivatedMembers(channelId string) *model.AppError {
@@ -1652,19 +2074,8 @@ func (s SqlChannelStore) PermanentDeleteMembersByUser(userId string) *model.AppE
 }
 
 func (s SqlChannelStore) UpdateLastViewedAt(channelIds []string, userId string) (map[string]int64, *model.AppError) {
-	props := make(map[string]interface{})
-
-	updateIdQuery := ""
-	for index, channelId := range channelIds {
-		if len(updateIdQuery) > 0 {
-			updateIdQuery += " OR "
-		}
-
-		props["channelId"+strconv.Itoa(index)] = channelId
-		updateIdQuery += "ChannelId = :channelId" + strconv.Itoa(index)
-	}
-
-	selectIdQuery := strings.Replace(updateIdQuery, "ChannelId", "Id", -1)
+	keys, props := MapStringsToQueryParams(channelIds, "Channel")
+	props["UserId"] = userId
 
 	var lastPostAtTimes []struct {
 		Id            string
@@ -1672,21 +2083,51 @@ func (s SqlChannelStore) UpdateLastViewedAt(channelIds []string, userId string) 
 		TotalMsgCount int64
 	}
 
-	selectQuery := "SELECT Id, LastPostAt, TotalMsgCount FROM Channels WHERE (" + selectIdQuery + ")"
+	query := `SELECT Id, LastPostAt, TotalMsgCount FROM Channels WHERE Id IN ` + keys
+	// TODO: use a CTE for mysql too when version 8 becomes the minimum supported version.
+	if s.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+		query = `WITH c AS ( ` + query + `),
+	updated AS (
+	UPDATE
+		ChannelMembers cm
+	SET
+		MentionCount = 0,
+		MsgCount = greatest(cm.MsgCount, c.TotalMsgCount),
+		LastViewedAt = greatest(cm.LastViewedAt, c.LastPostAt),
+		LastUpdateAt = greatest(cm.LastViewedAt, c.LastPostAt)
+	FROM c
+		WHERE cm.UserId = :UserId
+		AND c.Id=cm.ChannelId
+)
+	SELECT Id, LastPostAt FROM c`
+	}
 
-	if _, err := s.GetMaster().Select(&lastPostAtTimes, selectQuery, props); err != nil || len(lastPostAtTimes) <= 0 {
-		var extra string
+	_, err := s.GetMaster().Select(&lastPostAtTimes, query, props)
+	if err != nil || len(lastPostAtTimes) == 0 {
 		status := http.StatusInternalServerError
+		var extra string
 		if err == nil {
 			status = http.StatusBadRequest
 			extra = "No channels found"
 		} else {
 			extra = err.Error()
 		}
-		return nil, model.NewAppError("SqlChannelStore.UpdateLastViewedAt", "store.sql_channel.update_last_viewed_at.app_error", nil, "channel_ids="+strings.Join(channelIds, ",")+", user_id="+userId+", "+extra, status)
+
+		return nil, model.NewAppError("SqlChannelStore.UpdateLastViewedAt",
+			"store.sql_channel.update_last_viewed_at.app_error",
+			nil,
+			"channel_ids="+strings.Join(channelIds, ",")+", user_id="+userId+", "+extra,
+			status)
 	}
 
 	times := map[string]int64{}
+	if s.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+		for _, t := range lastPostAtTimes {
+			times[t.Id] = t.LastPostAt
+		}
+		return times, nil
+	}
+
 	msgCountQuery := ""
 	lastViewedQuery := ""
 	for index, t := range lastPostAtTimes {
@@ -1701,33 +2142,16 @@ func (s SqlChannelStore) UpdateLastViewedAt(channelIds []string, userId string) 
 		props["channelId"+strconv.Itoa(index)] = t.Id
 	}
 
-	var updateQuery string
-
-	if s.DriverName() == model.DATABASE_DRIVER_POSTGRES {
-		updateQuery = `UPDATE
-			ChannelMembers
-		SET
-			MentionCount = 0,
-			MsgCount = CAST(CASE ChannelId ` + msgCountQuery + ` END AS BIGINT),
-			LastViewedAt = CAST(CASE ChannelId ` + lastViewedQuery + ` END AS BIGINT),
-			LastUpdateAt = CAST(CASE ChannelId ` + lastViewedQuery + ` END AS BIGINT)
-		WHERE
-				UserId = :UserId
-				AND (` + updateIdQuery + `)`
-	} else if s.DriverName() == model.DATABASE_DRIVER_MYSQL {
-		updateQuery = `UPDATE
+	updateQuery := `UPDATE
 			ChannelMembers
 		SET
 			MentionCount = 0,
 			MsgCount = CASE ChannelId ` + msgCountQuery + ` END,
 			LastViewedAt = CASE ChannelId ` + lastViewedQuery + ` END,
-			LastUpdateAt = CASE ChannelId ` + lastViewedQuery + ` END
+			LastUpdateAt = LastViewedAt
 		WHERE
 				UserId = :UserId
-				AND (` + updateIdQuery + `)`
-	}
-
-	props["UserId"] = userId
+				AND ChannelId IN ` + keys
 
 	if _, err := s.GetMaster().Exec(updateQuery, props); err != nil {
 		return nil, model.NewAppError("SqlChannelStore.UpdateLastViewedAt", "store.sql_channel.update_last_viewed_at.app_error", nil, "channel_ids="+strings.Join(channelIds, ",")+", user_id="+userId+", "+err.Error(), http.StatusInternalServerError)
@@ -1869,9 +2293,12 @@ func (s SqlChannelStore) GetAll(teamId string) ([]*model.Channel, *model.AppErro
 	return data, nil
 }
 
-func (s SqlChannelStore) GetChannelsByIds(channelIds []string) ([]*model.Channel, *model.AppError) {
+func (s SqlChannelStore) GetChannelsByIds(channelIds []string, includeDeleted bool) ([]*model.Channel, *model.AppError) {
 	keys, params := MapStringsToQueryParams(channelIds, "Channel")
 	query := `SELECT * FROM Channels WHERE Id IN ` + keys + ` ORDER BY Name`
+	if !includeDeleted {
+		query = `SELECT * FROM Channels WHERE DeleteAt=0 AND Id IN ` + keys + ` ORDER BY Name`
+	}
 
 	var channels []*model.Channel
 	_, err := s.GetReplica().Select(&channels, query, params)
@@ -1953,7 +2380,7 @@ func (s SqlChannelStore) GetMembersForUserWithPagination(teamId, userId string, 
 }
 
 func (s SqlChannelStore) AutocompleteInTeam(teamId string, term string, includeDeleted bool) (*model.ChannelList, *model.AppError) {
-	deleteFilter := "AND c.DeleteAt = 0"
+	deleteFilter := "AND Channels.DeleteAt = 0"
 	if includeDeleted {
 		deleteFilter = ""
 	}
@@ -1966,7 +2393,7 @@ func (s SqlChannelStore) AutocompleteInTeam(teamId string, term string, includeD
 		JOIN
 			PublicChannels c ON (c.Id = Channels.Id)
 		WHERE
-			c.TeamId = :TeamId
+			Channels.TeamId = :TeamId
 			` + deleteFilter + `
 			%v
 		LIMIT ` + strconv.Itoa(model.CHANNEL_SEARCH_DEFAULT_LIMIT)
@@ -2212,8 +2639,7 @@ func (s SqlChannelStore) channelSearchQuery(term string, opts store.ChannelSearc
 	query := s.getQueryBuilder().
 		Select(selectStr).
 		From("Channels AS c").
-		Join("Teams AS t ON t.Id = c.TeamId").
-		Where(sq.Eq{"c.Type": []string{model.CHANNEL_PRIVATE, model.CHANNEL_OPEN}})
+		Join("Teams AS t ON t.Id = c.TeamId")
 
 	// don't bother ordering or limiting if we're just getting the count
 	if !countQuery {
@@ -2221,8 +2647,9 @@ func (s SqlChannelStore) channelSearchQuery(term string, opts store.ChannelSearc
 			OrderBy("c.DisplayName, t.DisplayName").
 			Limit(uint64(limit))
 	}
-
-	if !opts.IncludeDeleted {
+	if opts.Deleted {
+		query = query.Where(sq.NotEq{"c.DeleteAt": int(0)})
+	} else if !opts.IncludeDeleted {
 		query = query.Where(sq.Eq{"c.DeleteAt": int(0)})
 	}
 
@@ -2248,6 +2675,30 @@ func (s SqlChannelStore) channelSearchQuery(term string, opts store.ChannelSearc
 
 	if len(opts.NotAssociatedToGroup) > 0 {
 		query = query.Where("c.Id NOT IN (SELECT ChannelId FROM GroupChannels WHERE GroupChannels.GroupId = ? AND GroupChannels.DeleteAt = 0)", opts.NotAssociatedToGroup)
+	}
+
+	if len(opts.TeamIds) > 0 {
+		query = query.Where(sq.Eq{"c.TeamId": opts.TeamIds})
+	}
+
+	if opts.GroupConstrained {
+		query = query.Where(sq.Eq{"c.GroupConstrained": true})
+	} else if opts.ExcludeGroupConstrained {
+		query = query.Where(sq.Or{
+			sq.NotEq{"c.GroupConstrained": true},
+			sq.Eq{"c.GroupConstrained": nil},
+		})
+	}
+
+	if opts.Public && !opts.Private {
+		query = query.Where(sq.Eq{"c.Type": model.CHANNEL_OPEN})
+	} else if opts.Private && !opts.Public {
+		query = query.Where(sq.Eq{"c.Type": model.CHANNEL_PRIVATE})
+	} else {
+		query = query.Where(sq.Or{
+			sq.Eq{"c.Type": model.CHANNEL_OPEN},
+			sq.Eq{"c.Type": model.CHANNEL_PRIVATE},
+		})
 	}
 
 	return query
@@ -2331,7 +2782,7 @@ func (s SqlChannelStore) buildLIKEClause(term string, searchColumns string) (lik
 	}
 
 	likeClause = fmt.Sprintf("(%s)", strings.Join(searchFields, " OR "))
-	likeTerm += "%"
+	likeTerm = wildcardSearchTerm(likeTerm)
 	return
 }
 
@@ -2549,7 +3000,8 @@ func (s SqlChannelStore) MigrateChannelMembers(fromChannelId string, fromUserId 
 		return nil, nil
 	}
 
-	for _, member := range channelMembers {
+	for i := range channelMembers {
+		member := channelMembers[i]
 		roles := strings.Fields(member.Roles)
 		var newRoles []string
 		if !member.SchemeAdmin.Valid {
@@ -2835,4 +3287,42 @@ func (s SqlChannelStore) UserBelongsToChannels(userId string, channelIds []strin
 		return false, model.NewAppError("SqlChannelStore.UserBelongsToChannels", "store.sql_channel.user_belongs_to_channels.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 	return c > 0, nil
+}
+
+func (s SqlChannelStore) UpdateMembersRole(channelID string, userIDs []string) *model.AppError {
+	sql := fmt.Sprintf(`
+		UPDATE
+			ChannelMembers
+		SET
+			SchemeAdmin = CASE WHEN UserId IN ('%s') THEN
+				TRUE
+			ELSE
+				FALSE
+			END
+		WHERE
+			ChannelId = :ChannelId
+			AND (SchemeGuest = false OR SchemeGuest IS NULL)
+			`, strings.Join(userIDs, "', '"))
+
+	if _, err := s.GetMaster().Exec(sql, map[string]interface{}{"ChannelId": channelID}); err != nil {
+		return model.NewAppError("SqlChannelStore.UpdateMembersRole", "store.update_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	return nil
+}
+
+func (s SqlChannelStore) GroupSyncedChannelCount() (int64, *model.AppError) {
+	query := s.getQueryBuilder().Select("COUNT(*)").From("Channels").Where(sq.Eq{"GroupConstrained": true, "DeleteAt": 0})
+
+	sql, args, err := query.ToSql()
+	if err != nil {
+		return 0, model.NewAppError("SqlChannelStore.GroupSyncedChannelCount", "store.sql_group.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	count, err := s.GetReplica().SelectInt(sql, args...)
+	if err != nil {
+		return 0, model.NewAppError("SqlChannelStore.GroupSyncedChannelCount", "store.select_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	return count, nil
 }

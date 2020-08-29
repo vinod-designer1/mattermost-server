@@ -9,9 +9,12 @@ import (
 )
 
 type TeamSearch struct {
-	Term    string `json:"term"`
-	Page    *int   `json:"page,omitempty"`
-	PerPage *int   `json:"per_page,omitempty"`
+	Term                    string `json:"term"`
+	Page                    *int   `json:"page,omitempty"`
+	PerPage                 *int   `json:"per_page,omitempty"`
+	AllowOpenInvite         *bool  `json:"allow_open_invite,omitempty"`
+	GroupConstrained        *bool  `json:"group_constrained,omitempty"`
+	IncludeGroupConstrained *bool  `json:"include_group_constrained,omitempty"`
 }
 
 func (t *TeamSearch) IsPaginated() bool {
@@ -19,8 +22,8 @@ func (t *TeamSearch) IsPaginated() bool {
 }
 
 // ToJson convert a TeamSearch to json string
-func (c *TeamSearch) ToJson() string {
-	b, err := json.Marshal(c)
+func (t *TeamSearch) ToJson() string {
+	b, err := json.Marshal(t)
 	if err != nil {
 		return ""
 	}

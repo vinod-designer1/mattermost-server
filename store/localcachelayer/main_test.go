@@ -7,13 +7,24 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/mattermost/mattermost-server/v5/services/cache"
+
 	"github.com/mattermost/mattermost-server/v5/model"
+	cachemocks "github.com/mattermost/mattermost-server/v5/services/cache/mocks"
 	"github.com/mattermost/mattermost-server/v5/store"
 	"github.com/mattermost/mattermost-server/v5/store/storetest/mocks"
 	"github.com/mattermost/mattermost-server/v5/testlib"
+	"github.com/stretchr/testify/mock"
 )
 
 var mainHelper *testlib.MainHelper
+
+func getMockCacheProvider() cache.Provider {
+	mockCacheProvider := cachemocks.Provider{}
+	mockCacheProvider.On("NewCache", mock.Anything).
+		Return(cache.NewLRU(&cache.LRUOptions{Size: 128}))
+	return &mockCacheProvider
+}
 
 func getMockStore() *mocks.Store {
 	mockStore := mocks.Store{}
@@ -42,6 +53,12 @@ func getMockStore() *mocks.Store {
 	mockSchemesStore.On("Get", "123").Return(&fakeScheme, nil)
 	mockSchemesStore.On("PermanentDeleteAll").Return(nil)
 	mockStore.On("Scheme").Return(&mockSchemesStore)
+
+	fakeFileInfo := model.FileInfo{PostId: "123"}
+	mockFileInfoStore := mocks.FileInfoStore{}
+	mockFileInfoStore.On("GetForPost", "123", true, true, false).Return([]*model.FileInfo{&fakeFileInfo}, nil)
+	mockFileInfoStore.On("GetForPost", "123", true, true, true).Return([]*model.FileInfo{&fakeFileInfo}, nil)
+	mockStore.On("FileInfo").Return(&mockFileInfoStore)
 
 	fakeWebhook := model.IncomingWebhook{Id: "123"}
 	mockWebhookStore := mocks.WebhookStore{}
@@ -108,10 +125,22 @@ func getMockStore() *mocks.Store {
 	mockTermsOfServiceStore.On("Get", "123", false).Return(&fakeTermsOfService, nil)
 	mockStore.On("TermsOfService").Return(&mockTermsOfServiceStore)
 
-	fakeUser := []*model.User{{Id: "123"}}
+	fakeUser := []*model.User{{
+		Id:          "123",
+		AuthData:    model.NewString("authData"),
+		AuthService: "authService",
+	}}
 	mockUserStore := mocks.UserStore{}
 	mockUserStore.On("GetProfileByIds", []string{"123"}, &store.UserGetByIdsOpts{}, true).Return(fakeUser, nil)
 	mockUserStore.On("GetProfileByIds", []string{"123"}, &store.UserGetByIdsOpts{}, false).Return(fakeUser, nil)
+
+	fakeProfilesInChannelMap := map[string]*model.User{
+		"456": {Id: "456"},
+	}
+	mockUserStore.On("GetAllProfilesInChannel", "123", true).Return(fakeProfilesInChannelMap, nil)
+	mockUserStore.On("GetAllProfilesInChannel", "123", false).Return(fakeProfilesInChannelMap, nil)
+
+	mockUserStore.On("Get", "123").Return(fakeUser[0], nil)
 	mockStore.On("User").Return(&mockUserStore)
 
 	fakeUserTeamIds := []string{"1", "2", "3"}

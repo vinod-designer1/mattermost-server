@@ -35,16 +35,16 @@ func InitDBCommandContext(configDSN string) (*app.App, error) {
 
 	s, err := app.NewServer(
 		app.Config(configDSN, false),
-		app.StartElasticsearch,
+		app.StartSearchEngine,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	a := s.FakeApp()
+	a := app.New(app.ServerConnector(s))
 
 	if model.BuildEnterpriseReady == "true" {
-		a.LoadLicense()
+		a.Srv().LoadLicense()
 	}
 
 	return a, nil
